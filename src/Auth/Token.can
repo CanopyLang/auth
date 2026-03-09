@@ -1,0 +1,389 @@
+module Auth.Token exposing
+    ( StoredTokens
+    , RefreshConfig
+    , RefreshError(..)
+    , TokenResponse
+    , save
+    , load
+    , clear
+    , refresh
+    , bearerHeader
+    , authHeader
+    , tokenResponseDecoder
+    , refreshErrorToString
+    , parseScopes
+    , storedTokensEncoder
+    , storedTokensDecoder
+    , storageStrategyToInt
+    )
+
+
+{-| Token lifecycle management: storage, retrieval, and refresh.
+
+Handles persisting tokens to the configured storage area,
+loading them on application start, and performing token refresh
+requests when the access token is about to expire.
+
+# Stored Tokens
+
+@docs StoredTokens
+
+# Storage Operations
+
+@docs save, load, clear
+
+# Token Refresh
+
+@docs RefreshConfig, RefreshError, TokenResponse, refresh
+
+# HTTP Headers
+
+@docs bearerHeader, authHeader
+
+# Decoders
+
+@docs tokenResponseDecoder, storedTokensDecoder, storedTokensEncoder
+
+# Errors
+
+@docs refreshErrorToString
+
+# Utilities
+
+@docs parseScopes, storageStrategyToInt
+
+-}
+
+
+foreign import javascript "external/auth.js" as AuthFFI
+
+import Auth exposing (AccessToken, RefreshToken, StorageStrategy(..))
+import Http
+import Json.Decode
+import Json.Encode
+import Task exposing (Task)
+
+
+
+-- TYPES
+
+
+{-| Token data as stored in localStorage/sessionStorage.
+
+Uses raw strings rather than opaque types because this is the
+serialization boundary.
+-}
+type alias StoredTokens =
+    { accessToken : String
+    , refreshToken : Maybe String
+    , expiresAt : Int
+    }
+
+
+{-| Configuration for a token refresh request.
+
+- `endpoint` -- the token endpoint URL
+- `refreshToken` -- the refresh token to exchange
+- `headers` -- additional headers (e.g., client authentication)
+- `onResult` -- message constructor for the result
+-}
+type alias RefreshConfig msg =
+    { endpoint : String
+    , refreshToken : RefreshToken
+    , headers : List ( String, String )
+    , onResult : Result RefreshError TokenResponse -> msg
+    }
+
+
+{-| Errors that can occur during token refresh.
+
+- `RefreshNetworkError` -- HTTP-level failure
+- `RefreshDenied` -- server rejected the refresh (e.g., token revoked)
+- `RefreshDecodeError` -- could not decode the server response
+-}
+type RefreshError
+    = RefreshNetworkError Http.Error
+    | RefreshDenied String
+    | RefreshDecodeError String
+
+
+{-| A successful token response from the server.
+
+Follows the OAuth2 token response format (RFC 6749 Section 5.1).
+-}
+type alias TokenResponse =
+    { accessToken : String
+    , refreshToken : Maybe String
+    , expiresIn : Int
+    , tokenType : String
+    , scope : Maybe String
+    }
+
+
+
+-- STORAGE OPERATIONS
+
+
+{-| Convert a StorageStrategy to an integer tag for FFI.
+
+0 = LocalStorage, 1 = SessionStorage, 2 = MemoryOnly.
+-}
+storageStrategyToInt : StorageStrategy -> Int
+storageStrategyToInt strategy =
+    case strategy of
+        LocalStorage ->
+            0
+
+        SessionStorage ->
+            1
+
+        MemoryOnly ->
+            2
+
+
+{-| Save tokens to the configured storage area.
+
+Serializes the token data as JSON and writes it to localStorage,
+sessionStorage, or in-memory storage depending on the strategy.
+-}
+save : StorageStrategy -> StoredTokens -> Cmd msg
+save strategy tokens =
+    let
+        json =
+            Json.Encode.encode 0 (storedTokensEncoder tokens)
+
+        tag =
+            storageStrategyToInt strategy
+    in
+    Task.perform (\_ -> neverMsg) (AuthFFI.saveTokenString tag json)
+
+
+neverMsg : () -> msg
+neverMsg _ =
+    neverMsg ()
+
+
+{-| Load tokens from the configured storage area.
+
+Reads the stored JSON and deserializes it. Returns `Nothing` if
+no tokens are stored or the stored data is corrupted.
+-}
+load : StorageStrategy -> (Maybe StoredTokens -> msg) -> Cmd msg
+load strategy toMsg =
+    let
+        tag =
+            storageStrategyToInt strategy
+
+        decodeResult maybeStr =
+            case maybeStr of
+                Nothing ->
+                    toMsg Nothing
+
+                Just str ->
+                    case Json.Decode.decodeString storedTokensDecoder str of
+                        Ok tokens ->
+                            toMsg (Just tokens)
+
+                        Err _ ->
+                            toMsg Nothing
+    in
+    Task.perform decodeResult (AuthFFI.loadTokenString tag)
+
+
+{-| Clear all stored tokens from the configured storage area. -}
+clear : StorageStrategy -> Cmd msg
+clear strategy =
+    let
+        tag =
+            storageStrategyToInt strategy
+    in
+    Task.perform (\_ -> neverMsg) (AuthFFI.clearTokenString tag)
+
+
+
+-- JSON ENCODERS/DECODERS FOR STORAGE
+
+
+{-| JSON encoder for stored token data. -}
+storedTokensEncoder : StoredTokens -> Json.Encode.Value
+storedTokensEncoder tokens =
+    Json.Encode.object
+        [ ( "accessToken", Json.Encode.string tokens.accessToken )
+        , ( "refreshToken", encodeMaybeString tokens.refreshToken )
+        , ( "expiresAt", Json.Encode.int tokens.expiresAt )
+        ]
+
+
+encodeMaybeString : Maybe String -> Json.Encode.Value
+encodeMaybeString ms =
+    case ms of
+        Just s ->
+            Json.Encode.string s
+
+        Nothing ->
+            Json.Encode.null
+
+
+{-| JSON decoder for stored token data. -}
+storedTokensDecoder : Json.Decode.Decoder StoredTokens
+storedTokensDecoder =
+    Json.Decode.map3 StoredTokens
+        (Json.Decode.field "accessToken" Json.Decode.string)
+        (Json.Decode.maybe (Json.Decode.field "refreshToken" Json.Decode.string))
+        (Json.Decode.field "expiresAt" Json.Decode.int)
+
+
+
+-- TOKEN REFRESH
+
+
+{-| Perform a token refresh by exchanging a refresh token for new tokens.
+
+Sends a POST request to the token endpoint with the refresh token
+in the request body. The server should respond with a new access
+token (and optionally a new refresh token).
+-}
+refresh : RefreshConfig msg -> Cmd msg
+refresh config =
+    Http.post
+        { url = config.endpoint
+        , body = buildRefreshBody config.refreshToken
+        , expect = Http.expectStringResponse config.onResult handleRefreshResponse
+        }
+
+
+buildRefreshBody : RefreshToken -> Http.Body
+buildRefreshBody rt =
+    Http.stringBody "application/x-www-form-urlencoded"
+        ("grant_type=refresh_token&refresh_token=" ++ Auth.refreshTokenToString rt)
+
+
+handleRefreshResponse : Http.Response String -> Result RefreshError TokenResponse
+handleRefreshResponse response =
+    case response of
+        Http.BadUrl_ url ->
+            Err (RefreshNetworkError (Http.BadUrl url))
+
+        Http.Timeout_ ->
+            Err (RefreshNetworkError Http.Timeout)
+
+        Http.NetworkError_ ->
+            Err (RefreshNetworkError Http.NetworkError)
+
+        Http.BadStatus_ metadata body ->
+            if metadata.statusCode == 401 || metadata.statusCode == 403 then
+                Err (RefreshDenied ("Server rejected refresh: HTTP " ++ String.fromInt metadata.statusCode))
+
+            else
+                Err (RefreshNetworkError (Http.BadStatus metadata.statusCode))
+
+        Http.GoodStatus_ _ body ->
+            case Json.Decode.decodeString tokenResponseDecoder body of
+                Ok tokenResp ->
+                    Ok tokenResp
+
+                Err decErr ->
+                    Err (RefreshDecodeError (Json.Decode.errorToString decErr))
+
+
+
+-- HTTP HEADERS
+
+
+{-| Build an HTTP `Authorization: Bearer <token>` header.
+
+Use with `Http.request` to attach the access token to API calls.
+
+    Http.request
+        { method = "GET"
+        , headers = [ Auth.Token.authHeader myAccessToken ]
+        , url = "/api/data"
+        , ...
+        }
+
+-}
+authHeader : AccessToken -> Http.Header
+authHeader token =
+    Http.header "Authorization" ("Bearer " ++ Auth.accessTokenToString token)
+
+
+{-| Build a Bearer token value as a key-value pair.
+
+Returns `( "Authorization", "Bearer <token>" )` for use with
+APIs that accept headers as tuples.
+-}
+bearerHeader : AccessToken -> ( String, String )
+bearerHeader token =
+    ( "Authorization", "Bearer " ++ Auth.accessTokenToString token )
+
+
+
+-- DECODERS
+
+
+{-| JSON decoder for OAuth2 token responses (RFC 6749 Section 5.1).
+
+Decodes the standard fields: `access_token`, `refresh_token`,
+`expires_in`, `token_type`, and `scope`.
+-}
+tokenResponseDecoder : Json.Decode.Decoder TokenResponse
+tokenResponseDecoder =
+    Json.Decode.map5 TokenResponse
+        (Json.Decode.field "access_token" Json.Decode.string)
+        (Json.Decode.maybe (Json.Decode.field "refresh_token" Json.Decode.string))
+        (Json.Decode.field "expires_in" Json.Decode.int)
+        tokenTypeDecoder
+        (Json.Decode.maybe (Json.Decode.field "scope" Json.Decode.string))
+
+
+tokenTypeDecoder : Json.Decode.Decoder String
+tokenTypeDecoder =
+    Json.Decode.oneOf
+        [ Json.Decode.field "token_type" Json.Decode.string
+        , Json.Decode.succeed "Bearer"
+        ]
+
+
+
+-- ERRORS
+
+
+{-| Convert a refresh error to a human-readable string. -}
+refreshErrorToString : RefreshError -> String
+refreshErrorToString err =
+    case err of
+        RefreshNetworkError httpErr ->
+            "Network error during token refresh"
+
+        RefreshDenied reason ->
+            "Token refresh denied: " ++ reason
+
+        RefreshDecodeError reason ->
+            "Failed to decode refresh response: " ++ reason
+
+
+
+-- UTILITIES
+
+
+{-| Parse a space-separated scope string into a list of individual scopes.
+
+    parseScopes (Just "openid profile email")
+    -- [ "openid", "profile", "email" ]
+
+    parseScopes Nothing
+    -- []
+
+-}
+parseScopes : Maybe String -> List String
+parseScopes scopeStr =
+    case scopeStr of
+        Nothing ->
+            []
+
+        Just s ->
+            if String.isEmpty s then
+                []
+
+            else
+                String.split " " s

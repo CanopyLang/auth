@@ -1,0 +1,483 @@
+module Test.OAuth exposing (main, tests)
+
+import Basics exposing (..)
+import Auth.OAuth exposing (..)
+import Dict
+import Expect
+import Maybe exposing (Maybe(..))
+import Result exposing (Result(..))
+import Test exposing (..)
+import Url
+
+
+main : Test
+main =
+    tests
+
+
+tests : Test
+tests =
+    describe "Auth.OAuth"
+        [ providerConfigTests
+        , authorizationUrlTests
+        , parseRedirectTests
+        , validateStateTests
+        , queryStringTests
+        , oauthErrorToStringTests
+        ]
+
+
+samplePkce : PkceChallenge
+samplePkce =
+    { codeVerifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+    , codeChallenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+    , codeChallengeMethod = "S256"
+    }
+
+
+sampleAuthRequest : AuthRequest
+sampleAuthRequest =
+    { state = "abc123state"
+    , pkce = samplePkce
+    , nonce = Nothing
+    , redirectUri = "http://localhost:8000/callback"
+    }
+
+
+sampleAuthRequestWithNonce : AuthRequest
+sampleAuthRequestWithNonce =
+    { state = "abc123state"
+    , pkce = samplePkce
+    , nonce = Just "nonce_xyz"
+    , redirectUri = "http://localhost:8000/callback"
+    }
+
+
+googleConfig : ProviderConfig
+googleConfig =
+    google
+        { clientId = "test-client-id"
+        , redirectUri = "http://localhost:8000/callback"
+        , scopes = [ "openid", "profile" ]
+        }
+
+
+githubConfig : ProviderConfig
+githubConfig =
+    github
+        { clientId = "gh-client-id"
+        , redirectUri = "http://localhost:8000/callback"
+        , scopes = [ "read:user" ]
+        }
+
+
+microsoftConfig : ProviderConfig
+microsoftConfig =
+    microsoft
+        { clientId = "ms-client-id"
+        , redirectUri = "http://localhost:8000/callback"
+        , scopes = [ "openid" ]
+        }
+
+
+auth0Config : ProviderConfig
+auth0Config =
+    auth0
+        { domain = "test.auth0.com"
+        , clientId = "auth0-client-id"
+        , redirectUri = "http://localhost:8000/callback"
+        , scopes = [ "openid", "profile" ]
+        , audience = "https://api.example.com"
+        }
+
+
+providerConfigTests : Test
+providerConfigTests =
+    describe "Provider configs"
+        [ test "google has correct authorization endpoint" <|
+            \() ->
+                Expect.equal "https://accounts.google.com/o/oauth2/v2/auth" googleConfig.authorizationEndpoint
+        , test "google has correct token endpoint" <|
+            \() ->
+                Expect.equal "https://oauth2.googleapis.com/token" googleConfig.tokenEndpoint
+        , test "google has no audience" <|
+            \() ->
+                Expect.equal Nothing googleConfig.audience
+        , test "github has correct authorization endpoint" <|
+            \() ->
+                Expect.equal "https://github.com/login/oauth/authorize" githubConfig.authorizationEndpoint
+        , test "github has correct token endpoint" <|
+            \() ->
+                Expect.equal "https://github.com/login/oauth/access_token" githubConfig.tokenEndpoint
+        , test "microsoft has correct authorization endpoint" <|
+            \() ->
+                Expect.equal True (String.contains "microsoftonline.com" microsoftConfig.authorizationEndpoint)
+        , test "microsoft has correct token endpoint" <|
+            \() ->
+                Expect.equal True (String.contains "microsoftonline.com" microsoftConfig.tokenEndpoint)
+        , test "auth0 uses custom domain" <|
+            \() ->
+                Expect.equal "https://test.auth0.com/authorize" auth0Config.authorizationEndpoint
+        , test "auth0 has audience" <|
+            \() ->
+                Expect.equal (Just "https://api.example.com") auth0Config.audience
+        , test "auth0 token endpoint uses domain" <|
+            \() ->
+                Expect.equal "https://test.auth0.com/oauth/token" auth0Config.tokenEndpoint
+        , test "preserves client ID" <|
+            \() ->
+                Expect.equal "test-client-id" googleConfig.clientId
+        , test "preserves redirect URI" <|
+            \() ->
+                Expect.equal "http://localhost:8000/callback" googleConfig.redirectUri
+        , test "preserves scopes" <|
+            \() ->
+                Expect.equal [ "openid", "profile" ] googleConfig.scopes
+        ]
+
+
+authorizationUrlTests : Test
+authorizationUrlTests =
+    describe "authorizationUrl"
+        [ test "contains authorization endpoint" <|
+            \() ->
+                let
+                    url =
+                        authorizationUrl googleConfig sampleAuthRequest
+                in
+                Expect.equal True (String.startsWith "https://accounts.google.com/o/oauth2/v2/auth?" url)
+        , test "contains response_type=code" <|
+            \() ->
+                let
+                    url =
+                        authorizationUrl googleConfig sampleAuthRequest
+                in
+                Expect.equal True (String.contains "response_type=code" url)
+        , test "contains client_id" <|
+            \() ->
+                let
+                    url =
+                        authorizationUrl googleConfig sampleAuthRequest
+                in
+                Expect.equal True (String.contains "client_id=test-client-id" url)
+        , test "contains state" <|
+            \() ->
+                let
+                    url =
+                        authorizationUrl googleConfig sampleAuthRequest
+                in
+                Expect.equal True (String.contains "state=abc123state" url)
+        , test "contains code_challenge" <|
+            \() ->
+                let
+                    url =
+                        authorizationUrl googleConfig sampleAuthRequest
+                in
+                Expect.equal True (String.contains "code_challenge=" url)
+        , test "contains code_challenge_method=S256" <|
+            \() ->
+                let
+                    url =
+                        authorizationUrl googleConfig sampleAuthRequest
+                in
+                Expect.equal True (String.contains "code_challenge_method=S256" url)
+        , test "contains scope" <|
+            \() ->
+                let
+                    url =
+                        authorizationUrl googleConfig sampleAuthRequest
+                in
+                Expect.equal True (String.contains "scope=openid" url)
+        , test "includes audience for auth0" <|
+            \() ->
+                let
+                    url =
+                        authorizationUrl auth0Config sampleAuthRequest
+                in
+                Expect.equal True (String.contains "audience=" url)
+        , test "includes nonce when provided" <|
+            \() ->
+                let
+                    url =
+                        authorizationUrl googleConfig sampleAuthRequestWithNonce
+                in
+                Expect.equal True (String.contains "nonce=nonce_xyz" url)
+        , test "excludes nonce when not provided" <|
+            \() ->
+                let
+                    url =
+                        authorizationUrl googleConfig sampleAuthRequest
+                in
+                Expect.equal False (String.contains "nonce=" url)
+        ]
+
+
+parseRedirectTests : Test
+parseRedirectTests =
+    describe "parseRedirect"
+        [ test "parses valid redirect with code and state" <|
+            \() ->
+                let
+                    url =
+                        { protocol = Url.Https
+                        , host = "localhost"
+                        , port_ = Just 8000
+                        , path = "/callback"
+                        , query = Just "code=auth_code_123&state=state_abc"
+                        , fragment = Nothing
+                        }
+                in
+                case parseRedirect url of
+                    Ok resp ->
+                        Expect.all
+                            [ \r -> Expect.equal "auth_code_123" r.code
+                            , \r -> Expect.equal "state_abc" r.state
+                            ]
+                            resp
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ oauthErrorToString err)
+        , test "returns error when error param present" <|
+            \() ->
+                let
+                    url =
+                        { protocol = Url.Https
+                        , host = "localhost"
+                        , port_ = Just 8000
+                        , path = "/callback"
+                        , query = Just "error=access_denied&error_description=User%20denied"
+                        , fragment = Nothing
+                        }
+                in
+                case parseRedirect url of
+                    Err (AuthorizationDenied desc) ->
+                        Expect.equal True (String.contains "User denied" desc)
+
+                    _ ->
+                        Expect.fail "Expected AuthorizationDenied"
+        , test "returns error with fallback description" <|
+            \() ->
+                let
+                    url =
+                        { protocol = Url.Https
+                        , host = "localhost"
+                        , port_ = Just 8000
+                        , path = "/callback"
+                        , query = Just "error=server_error"
+                        , fragment = Nothing
+                        }
+                in
+                case parseRedirect url of
+                    Err (AuthorizationDenied desc) ->
+                        Expect.equal "server_error" desc
+
+                    _ ->
+                        Expect.fail "Expected AuthorizationDenied"
+        , test "fails when no code present" <|
+            \() ->
+                let
+                    url =
+                        { protocol = Url.Https
+                        , host = "localhost"
+                        , port_ = Just 8000
+                        , path = "/callback"
+                        , query = Just "state=abc"
+                        , fragment = Nothing
+                        }
+                in
+                case parseRedirect url of
+                    Err (AuthorizationDenied _) ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected AuthorizationDenied"
+        , test "fails when no state present" <|
+            \() ->
+                let
+                    url =
+                        { protocol = Url.Https
+                        , host = "localhost"
+                        , port_ = Just 8000
+                        , path = "/callback"
+                        , query = Just "code=abc"
+                        , fragment = Nothing
+                        }
+                in
+                case parseRedirect url of
+                    Err StateError ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected StateError"
+        , test "handles empty query string" <|
+            \() ->
+                let
+                    url =
+                        { protocol = Url.Https
+                        , host = "localhost"
+                        , port_ = Just 8000
+                        , path = "/callback"
+                        , query = Nothing
+                        , fragment = Nothing
+                        }
+                in
+                case parseRedirect url of
+                    Err _ ->
+                        Expect.pass
+
+                    Ok _ ->
+                        Expect.fail "Expected Err"
+        ]
+
+
+validateStateTests : Test
+validateStateTests =
+    describe "validateState"
+        [ test "succeeds when states match" <|
+            \() ->
+                let
+                    response =
+                        { code = "code123", state = "abc123state" }
+                in
+                case validateState sampleAuthRequest response of
+                    Ok resp ->
+                        Expect.equal "code123" resp.code
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ oauthErrorToString err)
+        , test "fails when states don't match" <|
+            \() ->
+                let
+                    response =
+                        { code = "code123", state = "wrong_state" }
+                in
+                case validateState sampleAuthRequest response of
+                    Err StateError ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected StateError"
+        , test "empty state does not match" <|
+            \() ->
+                let
+                    response =
+                        { code = "code123", state = "" }
+                in
+                case validateState sampleAuthRequest response of
+                    Err StateError ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected StateError"
+        ]
+
+
+queryStringTests : Test
+queryStringTests =
+    describe "Query string utilities"
+        [ test "buildQueryString with empty list" <|
+            \() ->
+                Expect.equal "" (buildQueryString [])
+        , test "buildQueryString with one param" <|
+            \() ->
+                Expect.equal "key=value" (buildQueryString [ ( "key", "value" ) ])
+        , test "buildQueryString with multiple params" <|
+            \() ->
+                let
+                    result =
+                        buildQueryString [ ( "a", "1" ), ( "b", "2" ) ]
+                in
+                Expect.equal True (String.contains "a=1" result && String.contains "b=2" result)
+        , test "buildQueryString encodes special characters" <|
+            \() ->
+                let
+                    result =
+                        buildQueryString [ ( "q", "hello world" ) ]
+                in
+                Expect.equal False (String.contains " " result)
+        , test "parseQueryString empty string" <|
+            \() ->
+                Expect.equal Dict.empty (parseQueryString "")
+        , test "parseQueryString single param" <|
+            \() ->
+                let
+                    result =
+                        parseQueryString "key=value"
+                in
+                Expect.equal (Just "value") (Dict.get "key" result)
+        , test "parseQueryString multiple params" <|
+            \() ->
+                let
+                    result =
+                        parseQueryString "a=1&b=2&c=3"
+                in
+                Expect.all
+                    [ \r -> Expect.equal (Just "1") (Dict.get "a" r)
+                    , \r -> Expect.equal (Just "2") (Dict.get "b" r)
+                    , \r -> Expect.equal (Just "3") (Dict.get "c" r)
+                    ]
+                    result
+        , test "parseQueryString with encoded values" <|
+            \() ->
+                let
+                    result =
+                        parseQueryString "q=hello%20world"
+                in
+                Expect.equal (Just "hello world") (Dict.get "q" result)
+        , test "parseQueryString with key only" <|
+            \() ->
+                let
+                    result =
+                        parseQueryString "key"
+                in
+                Expect.equal (Just "") (Dict.get "key" result)
+        , test "parseQueryString with multiple equals signs" <|
+            \() ->
+                let
+                    result =
+                        parseQueryString "a=1=2=3&b=4"
+                in
+                Expect.equal (Just "4") (Dict.get "b" result)
+        , test "parseQueryString with encoded key" <|
+            \() ->
+                let
+                    result =
+                        parseQueryString "my%20key=value"
+                in
+                Expect.equal (Just "value") (Dict.get "my key" result)
+        , test "buildQueryString roundtrip" <|
+            \() ->
+                let
+                    params =
+                        [ ( "client_id", "abc" ), ( "redirect_uri", "http://localhost" ) ]
+
+                    qs =
+                        buildQueryString params
+                in
+                Expect.all
+                    [ \s -> Expect.equal True (String.contains "client_id=abc" s)
+                    , \s -> Expect.equal True (String.contains "redirect_uri=" s)
+                    ]
+                    qs
+        ]
+
+
+oauthErrorToStringTests : Test
+oauthErrorToStringTests =
+    describe "oauthErrorToString"
+        [ test "StateError" <|
+            \() ->
+                Expect.equal True (String.contains "CSRF" (oauthErrorToString StateError))
+        , test "AuthorizationDenied" <|
+            \() ->
+                Expect.equal True (String.contains "denied" (oauthErrorToString (AuthorizationDenied "User clicked cancel")))
+        , test "CodeExchangeError" <|
+            \() ->
+                Expect.equal True (String.contains "exchange" (oauthErrorToString (CodeExchangeError "network")))
+        , test "TokenDecodeError" <|
+            \() ->
+                Expect.equal True (String.contains "decode" (oauthErrorToString (TokenDecodeError "bad json")))
+        , test "PkceError" <|
+            \() ->
+                Expect.equal True (String.contains "PKCE" (oauthErrorToString (PkceError "crypto unavailable")))
+        ]

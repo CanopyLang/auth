@@ -1,0 +1,435 @@
+module Auth.OAuth exposing
+    ( ProviderConfig
+    , PkceChallenge
+    , AuthRequest
+    , AuthResponse
+    , OAuthError(..)
+    , authorizationUrl
+    , parseRedirect
+    , validateState
+    , google
+    , github
+    , microsoft
+    , auth0
+    , oauthErrorToString
+    , buildQueryString
+    , parseQueryString
+    )
+
+
+{-| OAuth2 Authorization Code with PKCE flow helpers.
+
+Provides the building blocks for implementing the OAuth2 Authorization
+Code flow with PKCE (Proof Key for Code Exchange), which is the
+recommended flow for single-page applications (SPAs) that cannot
+securely store a client secret.
+
+**Flow overview:**
+
+1. Generate a PKCE challenge pair (code\_verifier + code\_challenge)
+2. Build the authorization URL and redirect the user to the provider
+3. Parse the authorization response from the redirect URL
+4. Validate the state parameter matches (CSRF protection)
+5. Exchange the authorization code for tokens (server-side or via CORS)
+
+# Provider Configuration
+
+@docs ProviderConfig
+
+# PKCE
+
+@docs PkceChallenge
+
+# Flow State
+
+@docs AuthRequest, AuthResponse, OAuthError
+
+# URL Building
+
+@docs authorizationUrl
+
+# Response Parsing
+
+@docs parseRedirect, validateState
+
+# Provider Presets
+
+@docs google, github, microsoft, auth0
+
+# Errors
+
+@docs oauthErrorToString
+
+# Query String Utilities
+
+@docs buildQueryString, parseQueryString
+
+-}
+
+
+import Dict exposing (Dict)
+import Url
+
+
+
+-- TYPES
+
+
+{-| OAuth2 provider configuration.
+
+Contains the endpoints and client details needed for the
+authorization code flow.
+-}
+type alias ProviderConfig =
+    { authorizationEndpoint : String
+    , tokenEndpoint : String
+    , clientId : String
+    , redirectUri : String
+    , scopes : List String
+    , audience : Maybe String
+    }
+
+
+{-| A PKCE challenge pair for the S256 method.
+
+The `codeVerifier` is kept secret (stored in memory only during
+the auth flow). The `codeChallenge` is sent to the authorization
+server in the URL.
+-}
+type alias PkceChallenge =
+    { codeVerifier : String
+    , codeChallenge : String
+    , codeChallengeMethod : String
+    }
+
+
+{-| State stored in the model during an in-progress authorization flow.
+
+Contains the CSRF state parameter and PKCE verifier needed to
+complete the flow when the user is redirected back.
+-}
+type alias AuthRequest =
+    { state : String
+    , pkce : PkceChallenge
+    , nonce : Maybe String
+    , redirectUri : String
+    }
+
+
+{-| Parsed authorization response from the provider redirect.
+
+Contains the authorization code and state parameter extracted
+from the redirect URL query string.
+-}
+type alias AuthResponse =
+    { code : String
+    , state : String
+    }
+
+
+{-| Errors that can occur during the OAuth2 flow.
+
+- `StateError` -- the state parameter does not match (possible CSRF attack)
+- `AuthorizationDenied` -- the user denied access or the provider returned an error
+- `CodeExchangeError` -- HTTP error during code-for-token exchange
+- `TokenDecodeError` -- could not decode the token response JSON
+- `PkceError` -- error generating PKCE challenge (e.g., crypto API unavailable)
+-}
+type OAuthError
+    = StateError
+    | AuthorizationDenied String
+    | CodeExchangeError String
+    | TokenDecodeError String
+    | PkceError String
+
+
+
+-- URL BUILDING
+
+
+{-| Build the authorization URL to redirect the user to.
+
+Constructs the full URL with all required OAuth2 and PKCE parameters:
+`response_type`, `client_id`, `redirect_uri`, `scope`, `state`,
+`code_challenge`, `code_challenge_method`, and optionally `audience`
+and `nonce`.
+
+    authorizationUrl config authRequest
+    -- "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&client_id=..."
+
+-}
+authorizationUrl : ProviderConfig -> AuthRequest -> String
+authorizationUrl config authReq =
+    let
+        baseParams =
+            [ ( "response_type", "code" )
+            , ( "client_id", config.clientId )
+            , ( "redirect_uri", authReq.redirectUri )
+            , ( "scope", String.join " " config.scopes )
+            , ( "state", authReq.state )
+            , ( "code_challenge", authReq.pkce.codeChallenge )
+            , ( "code_challenge_method", authReq.pkce.codeChallengeMethod )
+            ]
+
+        audienceParam =
+            case config.audience of
+                Just aud ->
+                    [ ( "audience", aud ) ]
+
+                Nothing ->
+                    []
+
+        nonceParam =
+            case authReq.nonce of
+                Just n ->
+                    [ ( "nonce", n ) ]
+
+                Nothing ->
+                    []
+
+        allParams =
+            baseParams ++ audienceParam ++ nonceParam
+    in
+    config.authorizationEndpoint ++ "?" ++ buildQueryString allParams
+
+
+
+-- RESPONSE PARSING
+
+
+{-| Parse the authorization response from the redirect URL.
+
+Extracts the `code` and `state` query parameters from the URL.
+Returns `AuthorizationDenied` if the URL contains an `error` parameter.
+-}
+parseRedirect : Url.Url -> Result OAuthError AuthResponse
+parseRedirect url =
+    let
+        queryParams =
+            parseQueryFromUrl url
+    in
+    case Dict.get "error" queryParams of
+        Just errorMsg ->
+            let
+                description =
+                    case Dict.get "error_description" queryParams of
+                        Just desc ->
+                            desc
+
+                        Nothing ->
+                            errorMsg
+            in
+            Err (AuthorizationDenied description)
+
+        Nothing ->
+            extractAuthResponse queryParams
+
+
+extractAuthResponse : Dict String String -> Result OAuthError AuthResponse
+extractAuthResponse params =
+    case Dict.get "code" params of
+        Nothing ->
+            Err (AuthorizationDenied "No authorization code in redirect URL")
+
+        Just code ->
+            case Dict.get "state" params of
+                Nothing ->
+                    Err StateError
+
+                Just state ->
+                    Ok { code = code, state = state }
+
+
+{-| Validate that the response state matches the request state.
+
+This is critical for CSRF protection. If the state does not match,
+the response may be from an attacker-initiated flow.
+-}
+validateState : AuthRequest -> AuthResponse -> Result OAuthError AuthResponse
+validateState authReq authResp =
+    if authReq.state == authResp.state then
+        Ok authResp
+
+    else
+        Err StateError
+
+
+
+-- PROVIDER PRESETS
+
+
+{-| Google OAuth2 provider configuration.
+
+    OAuth.google
+        { clientId = "your-client-id.apps.googleusercontent.com"
+        , redirectUri = "http://localhost:8000/callback"
+        , scopes = [ "openid", "profile", "email" ]
+        }
+
+-}
+google : { clientId : String, redirectUri : String, scopes : List String } -> ProviderConfig
+google opts =
+    { authorizationEndpoint = "https://accounts.google.com/o/oauth2/v2/auth"
+    , tokenEndpoint = "https://oauth2.googleapis.com/token"
+    , clientId = opts.clientId
+    , redirectUri = opts.redirectUri
+    , scopes = opts.scopes
+    , audience = Nothing
+    }
+
+
+{-| GitHub OAuth2 provider configuration.
+
+    OAuth.github
+        { clientId = "your-github-client-id"
+        , redirectUri = "http://localhost:8000/callback"
+        , scopes = [ "read:user", "user:email" ]
+        }
+
+-}
+github : { clientId : String, redirectUri : String, scopes : List String } -> ProviderConfig
+github opts =
+    { authorizationEndpoint = "https://github.com/login/oauth/authorize"
+    , tokenEndpoint = "https://github.com/login/oauth/access_token"
+    , clientId = opts.clientId
+    , redirectUri = opts.redirectUri
+    , scopes = opts.scopes
+    , audience = Nothing
+    }
+
+
+{-| Microsoft (Azure AD) OAuth2 provider configuration.
+
+Uses the common tenant endpoint. For single-tenant apps, replace
+the authorization and token endpoints with your tenant-specific URLs.
+
+    OAuth.microsoft
+        { clientId = "your-azure-client-id"
+        , redirectUri = "http://localhost:8000/callback"
+        , scopes = [ "openid", "profile", "User.Read" ]
+        }
+
+-}
+microsoft : { clientId : String, redirectUri : String, scopes : List String } -> ProviderConfig
+microsoft opts =
+    { authorizationEndpoint = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+    , tokenEndpoint = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+    , clientId = opts.clientId
+    , redirectUri = opts.redirectUri
+    , scopes = opts.scopes
+    , audience = Nothing
+    }
+
+
+{-| Auth0 OAuth2 provider configuration.
+
+Requires the Auth0 domain and API audience.
+
+    OAuth.auth0
+        { domain = "your-tenant.auth0.com"
+        , clientId = "your-auth0-client-id"
+        , redirectUri = "http://localhost:8000/callback"
+        , scopes = [ "openid", "profile", "email" ]
+        , audience = "https://your-api.example.com"
+        }
+
+-}
+auth0 : { domain : String, clientId : String, redirectUri : String, scopes : List String, audience : String } -> ProviderConfig
+auth0 opts =
+    { authorizationEndpoint = "https://" ++ opts.domain ++ "/authorize"
+    , tokenEndpoint = "https://" ++ opts.domain ++ "/oauth/token"
+    , clientId = opts.clientId
+    , redirectUri = opts.redirectUri
+    , scopes = opts.scopes
+    , audience = Just opts.audience
+    }
+
+
+
+-- ERRORS
+
+
+{-| Convert an OAuth error to a human-readable string. -}
+oauthErrorToString : OAuthError -> String
+oauthErrorToString err =
+    case err of
+        StateError ->
+            "State parameter mismatch (possible CSRF attack)"
+
+        AuthorizationDenied reason ->
+            "Authorization denied: " ++ reason
+
+        CodeExchangeError reason ->
+            "Code exchange failed: " ++ reason
+
+        TokenDecodeError reason ->
+            "Token decode failed: " ++ reason
+
+        PkceError reason ->
+            "PKCE error: " ++ reason
+
+
+
+-- QUERY STRING UTILITIES
+
+
+{-| Build a URL query string from a list of key-value pairs.
+
+Percent-encodes both keys and values.
+
+    buildQueryString [ ( "a", "1" ), ( "b", "hello world" ) ]
+    -- "a=1&b=hello%20world"
+
+-}
+buildQueryString : List ( String, String ) -> String
+buildQueryString params =
+    params
+        |> List.map encodeParam
+        |> String.join "&"
+
+
+encodeParam : ( String, String ) -> String
+encodeParam ( key, value ) =
+    Url.percentEncode key ++ "=" ++ Url.percentEncode value
+
+
+{-| Parse a query string into a dictionary of key-value pairs.
+
+Handles percent-decoding of both keys and values.
+
+    parseQueryString "a=1&b=hello%20world"
+    -- Dict.fromList [ ( "a", "1" ), ( "b", "hello world" ) ]
+
+-}
+parseQueryString : String -> Dict String String
+parseQueryString query =
+    if String.isEmpty query then
+        Dict.empty
+
+    else
+        query
+            |> String.split "&"
+            |> List.foldl parseOneParam Dict.empty
+
+
+parseOneParam : String -> Dict String String -> Dict String String
+parseOneParam segment dict =
+    case String.split "=" segment of
+        [ key, value ] ->
+            Dict.insert (Url.percentDecode key |> Maybe.withDefault key) (Url.percentDecode value |> Maybe.withDefault value) dict
+
+        [ key ] ->
+            Dict.insert (Url.percentDecode key |> Maybe.withDefault key) "" dict
+
+        _ ->
+            dict
+
+
+parseQueryFromUrl : Url.Url -> Dict String String
+parseQueryFromUrl url =
+    case url.query of
+        Nothing ->
+            Dict.empty
+
+        Just q ->
+            parseQueryString q

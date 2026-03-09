@@ -1,0 +1,257 @@
+module Auth.Guard exposing
+    ( GuardResult(..)
+    , requireAuth
+    , requireRole
+    , requireScope
+    , whenAuthenticated
+    , whenGuest
+    , mapGuardResult
+    , guardResultToMaybe
+    )
+
+
+{-| Protected route and view patterns.
+
+Provides type-safe route guards that check authentication state
+and authorization predicates before allowing access to pages.
+
+Guards produce a `GuardResult` that the application can pattern-match
+on to render the page, redirect to login, or show a forbidden message.
+
+# Guard Result
+
+@docs GuardResult
+
+# Route Guards
+
+@docs requireAuth, requireRole, requireScope
+
+# View Helpers
+
+@docs whenAuthenticated, whenGuest
+
+# Utilities
+
+@docs mapGuardResult, guardResultToMaybe
+
+-}
+
+
+import Auth exposing (Session(..))
+
+
+
+-- TYPES
+
+
+{-| The result of a route guard check.
+
+- `Allowed page` -- the user is authorized; render the page
+- `Redirect url` -- the user is not authenticated; redirect to login
+- `Forbidden` -- the user is authenticated but not authorized
+-}
+type GuardResult page
+    = Allowed page
+    | Redirect String
+    | Forbidden
+
+
+
+-- ROUTE GUARDS
+
+
+{-| Guard a page that requires authentication.
+
+Checks if the session is `Authenticated`. If so, passes the user
+to the `page` function. Otherwise redirects to `loginUrl`.
+
+    Guard.requireAuth
+        { session = model.session
+        , loginUrl = "/login"
+        , page = \user -> DashboardPage user
+        }
+
+-}
+requireAuth :
+    { session : Session user
+    , loginUrl : String
+    , page : user -> page
+    }
+    -> GuardResult page
+requireAuth config =
+    case config.session of
+        Authenticated auth ->
+            Allowed (config.page auth.user)
+
+        Expired auth ->
+            Redirect config.loginUrl
+
+        Authenticating ->
+            Redirect config.loginUrl
+
+        Guest ->
+            Redirect config.loginUrl
+
+
+{-| Guard a page that requires a specific role or condition.
+
+Like `requireAuth`, but also checks a predicate on the user.
+Returns `Forbidden` if the user is authenticated but the predicate
+fails.
+
+    Guard.requireRole
+        { session = model.session
+        , loginUrl = "/login"
+        , predicate = \user -> user.role == Admin
+        , page = \user -> AdminPage user
+        }
+
+-}
+requireRole :
+    { session : Session user
+    , loginUrl : String
+    , predicate : user -> Bool
+    , page : user -> page
+    }
+    -> GuardResult page
+requireRole config =
+    case config.session of
+        Authenticated auth ->
+            if config.predicate auth.user then
+                Allowed (config.page auth.user)
+
+            else
+                Forbidden
+
+        _ ->
+            Redirect config.loginUrl
+
+
+{-| Guard a page that requires specific OAuth scopes.
+
+Checks that the authenticated user's granted scopes include all
+required scopes. Returns `Forbidden` if any required scope is missing.
+
+    Guard.requireScope
+        { session = model.session
+        , loginUrl = "/login"
+        , requiredScopes = [ "admin", "write" ]
+        , page = \user -> AdminPage user
+        }
+
+-}
+requireScope :
+    { session : Session user
+    , loginUrl : String
+    , requiredScopes : List String
+    , page : user -> page
+    }
+    -> GuardResult page
+requireScope config =
+    case config.session of
+        Authenticated auth ->
+            if hasAllScopes config.requiredScopes auth.scopes then
+                Allowed (config.page auth.user)
+
+            else
+                Forbidden
+
+        _ ->
+            Redirect config.loginUrl
+
+
+hasAllScopes : List String -> List String -> Bool
+hasAllScopes required granted =
+    case required of
+        [] ->
+            True
+
+        scope :: rest ->
+            if List.member scope granted then
+                hasAllScopes rest granted
+
+            else
+                False
+
+
+
+-- VIEW HELPERS
+
+
+{-| Render content only when the user is authenticated.
+
+The first function receives the authenticated user. The second
+argument is the fallback content for unauthenticated states.
+
+    Guard.whenAuthenticated model.session
+        (\user -> div [] [ text ("Hello, " ++ user.name) ])
+        (button [ onClick StartLogin ] [ text "Login" ])
+
+-}
+whenAuthenticated : Session user -> (user -> view) -> view -> view
+whenAuthenticated session authenticatedView guestView =
+    case session of
+        Authenticated auth ->
+            authenticatedView auth.user
+
+        _ ->
+            guestView
+
+
+{-| Render content only when the user is a guest.
+
+The first argument is the guest content. The second is the
+fallback for authenticated states.
+
+    Guard.whenGuest model.session
+        (div [] [ text "Please log in" ])
+        (div [] [ text "Welcome back!" ])
+
+-}
+whenGuest : Session user -> view -> view -> view
+whenGuest session guestView authenticatedView =
+    case session of
+        Guest ->
+            guestView
+
+        _ ->
+            authenticatedView
+
+
+
+-- UTILITIES
+
+
+{-| Transform the page value inside a `GuardResult`.
+
+    mapGuardResult Dashboard (Allowed user) == Allowed (Dashboard user)
+    mapGuardResult Dashboard Forbidden == Forbidden
+
+-}
+mapGuardResult : (a -> b) -> GuardResult a -> GuardResult b
+mapGuardResult f result =
+    case result of
+        Allowed page ->
+            Allowed (f page)
+
+        Redirect url ->
+            Redirect url
+
+        Forbidden ->
+            Forbidden
+
+
+{-| Extract the allowed page value, if any.
+
+    guardResultToMaybe (Allowed page) == Just page
+    guardResultToMaybe Forbidden == Nothing
+
+-}
+guardResultToMaybe : GuardResult page -> Maybe page
+guardResultToMaybe result =
+    case result of
+        Allowed page ->
+            Just page
+
+        _ ->
+            Nothing

@@ -1,0 +1,35 @@
+{
+    "type": "package",
+    "name": "canopy/auth",
+    "summary": "Authentication helpers: JWT decoding, OAuth2 PKCE, token management, and route guards",
+    "license": "BSD-3-Clause",
+    "version": "1.0.0",
+    "exposed-modules": {
+        "Core": [
+            "Auth"
+        ],
+        "JWT": [
+            "Auth.Jwt"
+        ],
+        "Token Management": [
+            "Auth.Token"
+        ],
+        "OAuth2": [
+            "Auth.OAuth"
+        ],
+        "Route Guards": [
+            "Auth.Guard"
+        ]
+    },
+    "canopy-version": "0.19.0 <= v < 0.20.0",
+    "dependencies": {
+        "canopy/core": "1.0.0 <= v < 2.0.0",
+        "canopy/json": "1.1.0 <= v < 2.0.0",
+        "canopy/time": "1.0.0 <= v < 2.0.0",
+        "canopy/url": "1.0.0 <= v < 2.0.0",
+        "canopy/http": "2.0.0 <= v < 3.0.0"
+    },
+    "test-dependencies": {
+        "canopy/test": "1.0.0 <= v < 2.0.0"
+    }
+}

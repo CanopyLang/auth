@@ -1,0 +1,461 @@
+module Test.Jwt exposing (main, tests)
+
+import Basics exposing (..)
+import Auth.Jwt exposing (..)
+import Dict
+import Expect
+import Json.Decode
+import Maybe exposing (Maybe(..))
+import Result exposing (Result(..))
+import Test exposing (..)
+import Time
+
+
+main : Test
+main =
+    tests
+
+
+tests : Test
+tests =
+    describe "Auth.Jwt"
+        [ decodeTests
+        , decodePayloadTests
+        , decodePayloadWithTests
+        , isExpiredTests
+        , isExpiredWithBufferTests
+        , expiresAtTests
+        , getClaimTests
+        , getSubjectTests
+        , jwtErrorToStringTests
+        ]
+
+
+-- A valid JWT with header {"alg":"HS256","typ":"JWT"}
+-- and payload {"sub":"1234567890","name":"John Doe","iat":1516239022}
+-- Base64url encoded:
+--   header: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9
+--   payload: eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ
+--   signature: SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+
+
+validJwt : String
+validJwt =
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+
+
+-- JWT with exp claim: {"sub":"user1","exp":1700000000,"iat":1699999000}
+-- Base64url encoded payload: eyJzdWIiOiJ1c2VyMSIsImV4cCI6MTcwMDAwMDAwMCwiaWF0IjoxNjk5OTk5MDAwfQ
+jwtWithExp : String
+jwtWithExp =
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyMSIsImV4cCI6MTcwMDAwMDAwMCwiaWF0IjoxNjk5OTk5MDAwfQ.fakesig"
+
+
+-- JWT with nbf claim: {"sub":"user1","nbf":1800000000}
+-- Base64url encoded payload: eyJzdWIiOiJ1c2VyMSIsIm5iZiI6MTgwMDAwMDAwMH0
+jwtWithNbf : String
+jwtWithNbf =
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMSIsIm5iZiI6MTgwMDAwMDAwMH0.sig"
+
+
+-- JWT with all standard claims:
+-- {"iss":"auth.example.com","sub":"user42","aud":"myapp","exp":1700000000,"nbf":1699000000,"iat":1699000000,"jti":"abc-123"}
+-- Base64url: eyJpc3MiOiJhdXRoLmV4YW1wbGUuY29tIiwic3ViIjoidXNlcjQyIiwiYXVkIjoibXlhcHAiLCJleHAiOjE3MDAwMDAwMDAsIm5iZiI6MTY5OTAwMDAwMCwiaWF0IjoxNjk5MDAwMDAwLCJqdGkiOiJhYmMtMTIzIn0
+jwtAllClaims : String
+jwtAllClaims =
+    "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImtleTEifQ.eyJpc3MiOiJhdXRoLmV4YW1wbGUuY29tIiwic3ViIjoidXNlcjQyIiwiYXVkIjoibXlhcHAiLCJleHAiOjE3MDAwMDAwMDAsIm5iZiI6MTY5OTAwMDAwMCwiaWF0IjoxNjk5MDAwMDAwLCJqdGkiOiJhYmMtMTIzIn0.signature"
+
+
+decodeTests : Test
+decodeTests =
+    describe "decode"
+        [ test "decodes a valid JWT" <|
+            \() ->
+                case decode validJwt of
+                    Ok jwt ->
+                        Expect.equal "HS256" jwt.header.alg
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ jwtErrorToString err)
+        , test "extracts header typ" <|
+            \() ->
+                case decode validJwt of
+                    Ok jwt ->
+                        Expect.equal (Just "JWT") jwt.header.typ
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ jwtErrorToString err)
+        , test "extracts subject from payload" <|
+            \() ->
+                case decode validJwt of
+                    Ok jwt ->
+                        Expect.equal (Just "1234567890") jwt.payload.sub
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ jwtErrorToString err)
+        , test "preserves signature" <|
+            \() ->
+                case decode validJwt of
+                    Ok jwt ->
+                        Expect.equal "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c" jwt.signature
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ jwtErrorToString err)
+        , test "fails on empty string" <|
+            \() ->
+                case decode "" of
+                    Err InvalidFormat ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected InvalidFormat"
+        , test "fails on one segment" <|
+            \() ->
+                case decode "abc" of
+                    Err InvalidFormat ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected InvalidFormat"
+        , test "fails on two segments" <|
+            \() ->
+                case decode "abc.def" of
+                    Err InvalidFormat ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected InvalidFormat"
+        , test "fails on four segments" <|
+            \() ->
+                case decode "a.b.c.d" of
+                    Err InvalidFormat ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected InvalidFormat"
+        , test "fails on invalid base64url payload" <|
+            \() ->
+                -- Valid header but invalid base64url payload
+                case decode "eyJhbGciOiJIUzI1NiJ9.!!!invalid!!!.sig" of
+                    Err Base64DecodeError ->
+                        Expect.pass
+
+                    other ->
+                        Expect.fail "Expected Base64DecodeError"
+        , test "fails on valid base64 but invalid JSON payload" <|
+            \() ->
+                -- Valid header, valid base64url payload but not JSON
+                case decode "eyJhbGciOiJIUzI1NiJ9.bm90anNvbg.sig" of
+                    Err (JsonDecodeError _) ->
+                        Expect.pass
+
+                    other ->
+                        Expect.fail "Expected JsonDecodeError for payload"
+        , test "fails on invalid base64url header" <|
+            \() ->
+                case decode "!!!.eyJzdWIiOiIxIn0.sig" of
+                    Err Base64DecodeError ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected Base64DecodeError"
+        , test "fails on invalid JSON header" <|
+            \() ->
+                case decode "bm90anNvbg.eyJzdWIiOiIxIn0.sig" of
+                    Err (JsonDecodeError _) ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected JsonDecodeError"
+        , test "decodes JWT with all standard claims" <|
+            \() ->
+                case decode jwtAllClaims of
+                    Ok jwt ->
+                        Expect.all
+                            [ \j -> Expect.equal "RS256" j.header.alg
+                            , \j -> Expect.equal (Just "JWT") j.header.typ
+                            , \j -> Expect.equal (Just "key1") j.header.kid
+                            , \j -> Expect.equal (Just "auth.example.com") j.payload.iss
+                            , \j -> Expect.equal (Just "user42") j.payload.sub
+                            , \j -> Expect.equal (Just "myapp") j.payload.aud
+                            , \j -> Expect.equal (Just 1700000000) j.payload.exp
+                            , \j -> Expect.equal (Just 1699000000) j.payload.nbf
+                            , \j -> Expect.equal (Just 1699000000) j.payload.iat
+                            , \j -> Expect.equal (Just "abc-123") j.payload.jti
+                            ]
+                            jwt
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ jwtErrorToString err)
+        , test "decodes JWT with no optional header fields" <|
+            \() ->
+                case decode jwtWithNbf of
+                    Ok jwt ->
+                        Expect.all
+                            [ \j -> Expect.equal Nothing j.header.typ
+                            , \j -> Expect.equal Nothing j.header.kid
+                            ]
+                            jwt
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ jwtErrorToString err)
+        ]
+
+
+decodePayloadTests : Test
+decodePayloadTests =
+    describe "decodePayload"
+        [ test "decodes payload from valid JWT" <|
+            \() ->
+                case decodePayload validJwt of
+                    Ok payload ->
+                        Expect.equal (Just "1234567890") payload.sub
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ jwtErrorToString err)
+        , test "fails on invalid JWT" <|
+            \() ->
+                case decodePayload "not.a.jwt" of
+                    Err _ ->
+                        Expect.pass
+
+                    Ok _ ->
+                        Expect.fail "Expected Err"
+        , test "extracts iat claim" <|
+            \() ->
+                case decodePayload validJwt of
+                    Ok payload ->
+                        Expect.equal (Just 1516239022) payload.iat
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ jwtErrorToString err)
+        ]
+
+
+decodePayloadWithTests : Test
+decodePayloadWithTests =
+    describe "decodePayloadWith"
+        [ test "decodes with custom decoder" <|
+            \() ->
+                let
+                    nameDecoder =
+                        Json.Decode.field "name" Json.Decode.string
+                in
+                case decodePayloadWith nameDecoder validJwt of
+                    Ok name ->
+                        Expect.equal "John Doe" name
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ jwtErrorToString err)
+        , test "fails with wrong decoder" <|
+            \() ->
+                let
+                    decoder =
+                        Json.Decode.field "nonexistent" Json.Decode.string
+                in
+                case decodePayloadWith decoder validJwt of
+                    Err (JsonDecodeError _) ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected JsonDecodeError"
+        , test "fails on invalid format" <|
+            \() ->
+                case decodePayloadWith Json.Decode.string "no-dots" of
+                    Err InvalidFormat ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected InvalidFormat"
+        , test "fails on invalid base64url payload" <|
+            \() ->
+                case decodePayloadWith Json.Decode.string "eyJhbGciOiJIUzI1NiJ9.!!!.sig" of
+                    Err Base64DecodeError ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected Base64DecodeError"
+        ]
+
+
+isExpiredTests : Test
+isExpiredTests =
+    describe "isExpired"
+        [ test "not expired before exp time" <|
+            \() ->
+                case decodePayload jwtWithExp of
+                    Ok payload ->
+                        Expect.equal False (isExpired (Time.millisToPosix 1699999000000) payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        , test "expired after exp time" <|
+            \() ->
+                case decodePayload jwtWithExp of
+                    Ok payload ->
+                        Expect.equal True (isExpired (Time.millisToPosix 1700000001000) payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        , test "expired at exact exp time" <|
+            \() ->
+                case decodePayload jwtWithExp of
+                    Ok payload ->
+                        Expect.equal True (isExpired (Time.millisToPosix 1700000000000) payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        , test "not expired when no exp claim" <|
+            \() ->
+                let
+                    payload =
+                        { iss = Nothing
+                        , sub = Nothing
+                        , aud = Nothing
+                        , exp = Nothing
+                        , nbf = Nothing
+                        , iat = Nothing
+                        , jti = Nothing
+                        , claims = Dict.empty
+                        }
+                in
+                Expect.equal False (isExpired (Time.millisToPosix 9999999999000) payload)
+        ]
+
+
+isExpiredWithBufferTests : Test
+isExpiredWithBufferTests =
+    describe "isExpiredWithBuffer"
+        [ test "not expired with buffer when far from expiry" <|
+            \() ->
+                case decodePayload jwtWithExp of
+                    Ok payload ->
+                        Expect.equal False (isExpiredWithBuffer 300 (Time.millisToPosix 1699000000000) payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        , test "expired with buffer within buffer period" <|
+            \() ->
+                case decodePayload jwtWithExp of
+                    Ok payload ->
+                        Expect.equal True (isExpiredWithBuffer 300 (Time.millisToPosix 1699999800000) payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        , test "buffer of zero behaves like isExpired" <|
+            \() ->
+                case decodePayload jwtWithExp of
+                    Ok payload ->
+                        Expect.equal True (isExpiredWithBuffer 0 (Time.millisToPosix 1700000000000) payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        , test "not expired with buffer when no exp claim" <|
+            \() ->
+                let
+                    payload =
+                        { iss = Nothing, sub = Nothing, aud = Nothing, exp = Nothing
+                        , nbf = Nothing, iat = Nothing, jti = Nothing, claims = Dict.empty
+                        }
+                in
+                Expect.equal False (isExpiredWithBuffer 300 (Time.millisToPosix 9999999999000) payload)
+        ]
+
+
+expiresAtTests : Test
+expiresAtTests =
+    describe "expiresAt"
+        [ test "returns Just Posix when exp exists" <|
+            \() ->
+                case decodePayload jwtWithExp of
+                    Ok payload ->
+                        Expect.equal (Just (Time.millisToPosix 1700000000000)) (expiresAt payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        , test "returns Nothing when no exp claim" <|
+            \() ->
+                let
+                    payload =
+                        { iss = Nothing, sub = Nothing, aud = Nothing, exp = Nothing
+                        , nbf = Nothing, iat = Nothing, jti = Nothing, claims = Dict.empty
+                        }
+                in
+                Expect.equal Nothing (expiresAt payload)
+        ]
+
+
+getClaimTests : Test
+getClaimTests =
+    describe "getClaim"
+        [ test "gets string claim" <|
+            \() ->
+                case decodePayload validJwt of
+                    Ok payload ->
+                        Expect.equal (Just "John Doe") (getClaim "name" Json.Decode.string payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        , test "gets int claim" <|
+            \() ->
+                case decodePayload validJwt of
+                    Ok payload ->
+                        Expect.equal (Just 1516239022) (getClaim "iat" Json.Decode.int payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        , test "returns Nothing for missing claim" <|
+            \() ->
+                case decodePayload validJwt of
+                    Ok payload ->
+                        Expect.equal Nothing (getClaim "nonexistent" Json.Decode.string payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        , test "returns Nothing for wrong type" <|
+            \() ->
+                case decodePayload validJwt of
+                    Ok payload ->
+                        Expect.equal Nothing (getClaim "name" Json.Decode.int payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        ]
+
+
+getSubjectTests : Test
+getSubjectTests =
+    describe "getSubject"
+        [ test "returns subject when present" <|
+            \() ->
+                case decodePayload validJwt of
+                    Ok payload ->
+                        Expect.equal (Just "1234567890") (getSubject payload)
+
+                    Err err ->
+                        Expect.fail ("decode failed: " ++ jwtErrorToString err)
+        , test "returns Nothing when no sub claim" <|
+            \() ->
+                let
+                    payload =
+                        { iss = Nothing, sub = Nothing, aud = Nothing, exp = Nothing
+                        , nbf = Nothing, iat = Nothing, jti = Nothing, claims = Dict.empty
+                        }
+                in
+                Expect.equal Nothing (getSubject payload)
+        ]
+
+
+jwtErrorToStringTests : Test
+jwtErrorToStringTests =
+    describe "jwtErrorToString"
+        [ test "InvalidFormat" <|
+            \() ->
+                Expect.equal True (String.contains "three" (jwtErrorToString InvalidFormat))
+        , test "Base64DecodeError" <|
+            \() ->
+                Expect.equal True (String.contains "base64url" (jwtErrorToString Base64DecodeError))
+        , test "JsonDecodeError" <|
+            \() ->
+                Expect.equal True (String.contains "JSON" (jwtErrorToString (JsonDecodeError "bad field")))
+        ]

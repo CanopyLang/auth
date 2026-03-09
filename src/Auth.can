@@ -1,0 +1,338 @@
+module Auth exposing
+    ( Session(..)
+    , AuthenticatedUser
+    , AccessToken
+    , RefreshToken
+    , StorageStrategy(..)
+    , Config
+    , accessToken
+    , refreshToken
+    , accessTokenToString
+    , refreshTokenToString
+    , isAuthenticated
+    , getUser
+    , getAccessToken
+    , getAuthenticatedUser
+    , login
+    , isExpired
+    , isExpiringSoon
+    , mapSession
+    , sessionToString
+    )
+
+
+{-| Core authentication state management.
+
+Models authentication as a state machine with explicit transitions.
+Tokens are wrapped in opaque types to prevent accidental misuse
+(e.g., using a refresh token where an access token is expected).
+
+# Session State
+
+@docs Session, AuthenticatedUser
+
+# Token Types
+
+@docs AccessToken, RefreshToken, accessToken, refreshToken,
+    accessTokenToString, refreshTokenToString
+
+# Configuration
+
+@docs Config, StorageStrategy
+
+# Session Queries
+
+@docs isAuthenticated, getUser, getAccessToken, getAuthenticatedUser
+
+# Session Transitions
+
+@docs login
+
+# Expiry
+
+@docs isExpired, isExpiringSoon
+
+# Utilities
+
+@docs mapSession, sessionToString
+
+-}
+
+
+import Time
+
+
+
+-- SESSION STATE
+
+
+{-| The authentication session state machine.
+
+- `Guest` -- not authenticated
+- `Authenticating` -- auth flow in progress (redirect, loading)
+- `Authenticated` -- successfully authenticated with user data and tokens
+- `Expired` -- was authenticated but the access token has expired
+-}
+type Session user
+    = Guest
+    | Authenticating
+    | Authenticated (AuthenticatedUser user)
+    | Expired (AuthenticatedUser user)
+
+
+{-| An authenticated user with their tokens and profile data.
+
+The `user` field holds application-specific user data decoded from
+a JWT or a /me endpoint. Tokens are opaque to prevent misuse.
+-}
+type alias AuthenticatedUser user =
+    { user : user
+    , accessToken : AccessToken
+    , refreshToken : Maybe RefreshToken
+    , expiresAt : Time.Posix
+    , scopes : List String
+    }
+
+
+
+-- TOKEN TYPES
+
+
+{-| An opaque access token. Use `accessTokenToString` to extract
+the raw string for HTTP headers or storage.
+-}
+type AccessToken
+    = AccessToken String
+
+
+{-| An opaque refresh token. Use `refreshTokenToString` to extract
+the raw string for token refresh requests.
+-}
+type RefreshToken
+    = RefreshToken String
+
+
+{-| Wrap a raw string as an access token.
+
+Use at system boundaries (e.g., after decoding a token response).
+-}
+accessToken : String -> AccessToken
+accessToken raw =
+    AccessToken raw
+
+
+{-| Wrap a raw string as a refresh token.
+
+Use at system boundaries (e.g., after decoding a token response).
+-}
+refreshToken : String -> RefreshToken
+refreshToken raw =
+    RefreshToken raw
+
+
+{-| Extract the raw string from an access token.
+
+Use when building HTTP Authorization headers or saving to storage.
+-}
+accessTokenToString : AccessToken -> String
+accessTokenToString (AccessToken raw) =
+    raw
+
+
+{-| Extract the raw string from a refresh token.
+
+Use when sending a refresh request to the token endpoint.
+-}
+refreshTokenToString : RefreshToken -> String
+refreshTokenToString (RefreshToken raw) =
+    raw
+
+
+
+-- CONFIGURATION
+
+
+{-| Where to persist tokens between page loads.
+
+- `LocalStorage` -- persists across tabs and browser restarts
+- `SessionStorage` -- persists within a tab, cleared on close
+- `MemoryOnly` -- lost on page refresh (most secure against XSS)
+-}
+type StorageStrategy
+    = LocalStorage
+    | SessionStorage
+    | MemoryOnly
+
+
+{-| Authentication configuration.
+
+- `tokenEndpoint` -- URL for token refresh requests
+- `refreshBuffer` -- seconds before expiry to trigger proactive refresh
+- `storage` -- where to persist tokens
+-}
+type alias Config =
+    { tokenEndpoint : String
+    , refreshBuffer : Int
+    , storage : StorageStrategy
+    }
+
+
+
+-- SESSION QUERIES
+
+
+{-| Check whether the session is in the `Authenticated` state. -}
+isAuthenticated : Session user -> Bool
+isAuthenticated session =
+    case session of
+        Authenticated _ ->
+            True
+
+        _ ->
+            False
+
+
+{-| Extract the application-specific user data, if authenticated. -}
+getUser : Session user -> Maybe user
+getUser session =
+    case session of
+        Authenticated auth ->
+            Just auth.user
+
+        Expired auth ->
+            Just auth.user
+
+        _ ->
+            Nothing
+
+
+{-| Extract the access token, if authenticated and not expired. -}
+getAccessToken : Session user -> Maybe AccessToken
+getAccessToken session =
+    case session of
+        Authenticated auth ->
+            Just auth.accessToken
+
+        _ ->
+            Nothing
+
+
+{-| Extract the full authenticated user record, if authenticated. -}
+getAuthenticatedUser : Session user -> Maybe (AuthenticatedUser user)
+getAuthenticatedUser session =
+    case session of
+        Authenticated auth ->
+            Just auth
+
+        _ ->
+            Nothing
+
+
+
+-- SESSION TRANSITIONS
+
+
+{-| Transition to the `Authenticated` state with the given user data
+and tokens.
+-}
+login : AuthenticatedUser user -> Session user
+login auth =
+    Authenticated auth
+
+
+
+-- EXPIRY
+
+
+{-| Check if the access token is expired at the given time.
+
+Returns `False` for `Guest` and `Authenticating` states.
+Returns `True` for `Expired` state unconditionally.
+-}
+isExpired : Time.Posix -> Session user -> Bool
+isExpired now session =
+    case session of
+        Authenticated auth ->
+            Time.posixToMillis now >= Time.posixToMillis auth.expiresAt
+
+        Expired _ ->
+            True
+
+        _ ->
+            False
+
+
+{-| Check if the access token will expire within `refreshBuffer` seconds.
+
+Useful for triggering proactive token refresh before the token actually
+expires, avoiding failed API calls.
+-}
+isExpiringSoon : Config -> Time.Posix -> Session user -> Bool
+isExpiringSoon config now session =
+    case session of
+        Authenticated auth ->
+            let
+                bufferMs =
+                    config.refreshBuffer * 1000
+
+                expiresAtMs =
+                    Time.posixToMillis auth.expiresAt
+            in
+            Time.posixToMillis now + bufferMs >= expiresAtMs
+
+        Expired _ ->
+            True
+
+        _ ->
+            False
+
+
+
+-- UTILITIES
+
+
+{-| Transform the user data inside a session without changing state. -}
+mapSession : (a -> b) -> Session a -> Session b
+mapSession f session =
+    case session of
+        Guest ->
+            Guest
+
+        Authenticating ->
+            Authenticating
+
+        Authenticated auth ->
+            Authenticated (mapAuthUser f auth)
+
+        Expired auth ->
+            Expired (mapAuthUser f auth)
+
+
+mapAuthUser : (a -> b) -> AuthenticatedUser a -> AuthenticatedUser b
+mapAuthUser f auth =
+    { user = f auth.user
+    , accessToken = auth.accessToken
+    , refreshToken = auth.refreshToken
+    , expiresAt = auth.expiresAt
+    , scopes = auth.scopes
+    }
+
+
+{-| Get a human-readable string describing the session state.
+
+Useful for debugging and logging.
+-}
+sessionToString : Session user -> String
+sessionToString session =
+    case session of
+        Guest ->
+            "Guest"
+
+        Authenticating ->
+            "Authenticating"
+
+        Authenticated _ ->
+            "Authenticated"
+
+        Expired _ ->
+            "Expired"

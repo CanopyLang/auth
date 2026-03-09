@@ -1,0 +1,370 @@
+module Test.Guard exposing (main, tests)
+
+import Basics exposing (..)
+import Auth exposing (Session(..), AccessToken, accessToken, refreshToken)
+import Auth.Guard exposing (..)
+import Expect
+import Maybe exposing (Maybe(..))
+import Test exposing (..)
+import Time
+
+
+main : Test
+main =
+    tests
+
+
+tests : Test
+tests =
+    describe "Auth.Guard"
+        [ requireAuthTests
+        , requireRoleTests
+        , requireScopeTests
+        , whenAuthenticatedTests
+        , whenGuestTests
+        , mapGuardResultTests
+        , guardResultToMaybeTests
+        ]
+
+
+sampleAuth : Auth.AuthenticatedUser String
+sampleAuth =
+    { user = "alice"
+    , accessToken = accessToken "token_abc"
+    , refreshToken = Just (refreshToken "refresh_xyz")
+    , expiresAt = Time.millisToPosix 1700000000000
+    , scopes = [ "read", "write", "admin" ]
+    }
+
+
+sampleAuthNoScopes : Auth.AuthenticatedUser String
+sampleAuthNoScopes =
+    { user = "bob"
+    , accessToken = accessToken "token_def"
+    , refreshToken = Nothing
+    , expiresAt = Time.millisToPosix 1700000000000
+    , scopes = []
+    }
+
+
+requireAuthTests : Test
+requireAuthTests =
+    describe "requireAuth"
+        [ test "allows authenticated users" <|
+            \() ->
+                case requireAuth { session = Authenticated sampleAuth, loginUrl = "/login", page = identity } of
+                    Allowed user ->
+                        Expect.equal "alice" user
+
+                    _ ->
+                        Expect.fail "Expected Allowed"
+        , test "redirects guests to login" <|
+            \() ->
+                case requireAuth { session = Guest, loginUrl = "/login", page = identity } of
+                    Redirect url ->
+                        Expect.equal "/login" url
+
+                    _ ->
+                        Expect.fail "Expected Redirect"
+        , test "redirects authenticating to login" <|
+            \() ->
+                case requireAuth { session = Authenticating, loginUrl = "/login", page = identity } of
+                    Redirect url ->
+                        Expect.equal "/login" url
+
+                    _ ->
+                        Expect.fail "Expected Redirect"
+        , test "redirects expired to login" <|
+            \() ->
+                case requireAuth { session = Expired sampleAuth, loginUrl = "/login", page = identity } of
+                    Redirect url ->
+                        Expect.equal "/login" url
+
+                    _ ->
+                        Expect.fail "Expected Redirect"
+        , test "transforms user with page function" <|
+            \() ->
+                case requireAuth { session = Authenticated sampleAuth, loginUrl = "/login", page = String.length } of
+                    Allowed len ->
+                        Expect.equal 5 len
+
+                    _ ->
+                        Expect.fail "Expected Allowed"
+        ]
+
+
+requireRoleTests : Test
+requireRoleTests =
+    describe "requireRole"
+        [ test "allows when predicate passes" <|
+            \() ->
+                let
+                    config =
+                        { session = Authenticated sampleAuth
+                        , loginUrl = "/login"
+                        , predicate = \user -> user == "alice"
+                        , page = identity
+                        }
+                in
+                case requireRole config of
+                    Allowed user ->
+                        Expect.equal "alice" user
+
+                    _ ->
+                        Expect.fail "Expected Allowed"
+        , test "returns Forbidden when predicate fails" <|
+            \() ->
+                let
+                    config =
+                        { session = Authenticated sampleAuth
+                        , loginUrl = "/login"
+                        , predicate = \user -> user == "bob"
+                        , page = identity
+                        }
+                in
+                case requireRole config of
+                    Forbidden ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected Forbidden"
+        , test "redirects guests" <|
+            \() ->
+                let
+                    config =
+                        { session = Guest
+                        , loginUrl = "/signin"
+                        , predicate = \_ -> True
+                        , page = identity
+                        }
+                in
+                case requireRole config of
+                    Redirect url ->
+                        Expect.equal "/signin" url
+
+                    _ ->
+                        Expect.fail "Expected Redirect"
+        , test "redirects expired sessions" <|
+            \() ->
+                let
+                    config =
+                        { session = Expired sampleAuth
+                        , loginUrl = "/login"
+                        , predicate = \_ -> True
+                        , page = identity
+                        }
+                in
+                case requireRole config of
+                    Redirect _ ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected Redirect"
+        ]
+
+
+requireScopeTests : Test
+requireScopeTests =
+    describe "requireScope"
+        [ test "allows when all scopes present" <|
+            \() ->
+                let
+                    config =
+                        { session = Authenticated sampleAuth
+                        , loginUrl = "/login"
+                        , requiredScopes = [ "read", "write" ]
+                        , page = identity
+                        }
+                in
+                case requireScope config of
+                    Allowed user ->
+                        Expect.equal "alice" user
+
+                    _ ->
+                        Expect.fail "Expected Allowed"
+        , test "allows when empty scopes required" <|
+            \() ->
+                let
+                    config =
+                        { session = Authenticated sampleAuthNoScopes
+                        , loginUrl = "/login"
+                        , requiredScopes = []
+                        , page = identity
+                        }
+                in
+                case requireScope config of
+                    Allowed _ ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected Allowed"
+        , test "returns Forbidden when scope missing" <|
+            \() ->
+                let
+                    config =
+                        { session = Authenticated sampleAuthNoScopes
+                        , loginUrl = "/login"
+                        , requiredScopes = [ "admin" ]
+                        , page = identity
+                        }
+                in
+                case requireScope config of
+                    Forbidden ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected Forbidden"
+        , test "returns Forbidden when partial scopes" <|
+            \() ->
+                let
+                    config =
+                        { session = Authenticated sampleAuth
+                        , loginUrl = "/login"
+                        , requiredScopes = [ "read", "delete" ]
+                        , page = identity
+                        }
+                in
+                case requireScope config of
+                    Forbidden ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected Forbidden"
+        , test "redirects guests" <|
+            \() ->
+                let
+                    config =
+                        { session = Guest
+                        , loginUrl = "/login"
+                        , requiredScopes = [ "read" ]
+                        , page = identity
+                        }
+                in
+                case requireScope config of
+                    Redirect _ ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected Redirect"
+        ]
+
+
+whenAuthenticatedTests : Test
+whenAuthenticatedTests =
+    describe "whenAuthenticated"
+        [ test "renders authenticated view for authenticated user" <|
+            \() ->
+                let
+                    result =
+                        whenAuthenticated (Authenticated sampleAuth)
+                            (\user -> "Hello " ++ user)
+                            "Please login"
+                in
+                Expect.equal "Hello alice" result
+        , test "renders fallback for guest" <|
+            \() ->
+                let
+                    result =
+                        whenAuthenticated Guest
+                            (\user -> "Hello " ++ user)
+                            "Please login"
+                in
+                Expect.equal "Please login" result
+        , test "renders fallback for authenticating" <|
+            \() ->
+                let
+                    result =
+                        whenAuthenticated Authenticating
+                            (\user -> "Hello " ++ user)
+                            "Please login"
+                in
+                Expect.equal "Please login" result
+        , test "renders fallback for expired" <|
+            \() ->
+                let
+                    result =
+                        whenAuthenticated (Expired sampleAuth)
+                            (\user -> "Hello " ++ user)
+                            "Please login"
+                in
+                Expect.equal "Please login" result
+        ]
+
+
+whenGuestTests : Test
+whenGuestTests =
+    describe "whenGuest"
+        [ test "renders guest view for guest" <|
+            \() ->
+                let
+                    result =
+                        whenGuest Guest "Guest view" "Auth view"
+                in
+                Expect.equal "Guest view" result
+        , test "renders fallback for authenticated" <|
+            \() ->
+                let
+                    result =
+                        whenGuest (Authenticated sampleAuth) "Guest view" "Auth view"
+                in
+                Expect.equal "Auth view" result
+        , test "renders fallback for authenticating" <|
+            \() ->
+                let
+                    result =
+                        whenGuest Authenticating "Guest view" "Auth view"
+                in
+                Expect.equal "Auth view" result
+        , test "renders fallback for expired" <|
+            \() ->
+                let
+                    result =
+                        whenGuest (Expired sampleAuth) "Guest view" "Auth view"
+                in
+                Expect.equal "Auth view" result
+        ]
+
+
+mapGuardResultTests : Test
+mapGuardResultTests =
+    describe "mapGuardResult"
+        [ test "maps Allowed value" <|
+            \() ->
+                case mapGuardResult String.length (Allowed "hello") of
+                    Allowed len ->
+                        Expect.equal 5 len
+
+                    _ ->
+                        Expect.fail "Expected Allowed"
+        , test "preserves Redirect" <|
+            \() ->
+                case mapGuardResult String.length (Redirect "/login") of
+                    Redirect url ->
+                        Expect.equal "/login" url
+
+                    _ ->
+                        Expect.fail "Expected Redirect"
+        , test "preserves Forbidden" <|
+            \() ->
+                case mapGuardResult String.length Forbidden of
+                    Forbidden ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected Forbidden"
+        ]
+
+
+guardResultToMaybeTests : Test
+guardResultToMaybeTests =
+    describe "guardResultToMaybe"
+        [ test "returns Just for Allowed" <|
+            \() ->
+                Expect.equal (Just "page") (guardResultToMaybe (Allowed "page"))
+        , test "returns Nothing for Redirect" <|
+            \() ->
+                Expect.equal Nothing (guardResultToMaybe (Redirect "/login"))
+        , test "returns Nothing for Forbidden" <|
+            \() ->
+                Expect.equal Nothing (guardResultToMaybe Forbidden)
+        ]

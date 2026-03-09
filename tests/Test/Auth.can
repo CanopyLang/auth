@@ -1,0 +1,325 @@
+module Test.Auth exposing (main, tests)
+
+import Basics exposing (..)
+import Auth exposing (..)
+import Expect
+import Maybe exposing (Maybe(..))
+import Result exposing (Result(..))
+import Test exposing (..)
+import Time
+
+
+main : Test
+main =
+    tests
+
+
+tests : Test
+tests =
+    describe "Auth"
+        [ tokenTypeTests
+        , sessionStateTests
+        , sessionQueryTests
+        , expiryTests
+        , mapSessionTests
+        , sessionToStringTests
+        ]
+
+
+tokenTypeTests : Test
+tokenTypeTests =
+    describe "Token types"
+        [ test "accessToken roundtrip" <|
+            \() ->
+                let
+                    token =
+                        accessToken "abc123"
+                in
+                Expect.equal "abc123" (accessTokenToString token)
+        , test "refreshToken roundtrip" <|
+            \() ->
+                let
+                    token =
+                        refreshToken "refresh_xyz"
+                in
+                Expect.equal "refresh_xyz" (refreshTokenToString token)
+        , test "empty access token roundtrip" <|
+            \() ->
+                Expect.equal "" (accessTokenToString (accessToken ""))
+        , test "access token with special characters" <|
+            \() ->
+                let
+                    raw =
+                        "eyJhbGciOiJSUzI1NiJ9.payload.sig"
+                in
+                Expect.equal raw (accessTokenToString (accessToken raw))
+        , test "refresh token with special characters" <|
+            \() ->
+                let
+                    raw =
+                        "v1.MjA0MTY0NTk2OA.abc-def_ghi"
+                in
+                Expect.equal raw (refreshTokenToString (refreshToken raw))
+        ]
+
+
+sampleAuthUser : AuthenticatedUser String
+sampleAuthUser =
+    { user = "alice"
+    , accessToken = accessToken "at_123"
+    , refreshToken = Just (refreshToken "rt_456")
+    , expiresAt = Time.millisToPosix 1700000000000
+    , scopes = [ "openid", "profile" ]
+    }
+
+
+sampleAuthUserNoRefresh : AuthenticatedUser String
+sampleAuthUserNoRefresh =
+    { user = "bob"
+    , accessToken = accessToken "at_789"
+    , refreshToken = Nothing
+    , expiresAt = Time.millisToPosix 1700000000000
+    , scopes = []
+    }
+
+
+sessionStateTests : Test
+sessionStateTests =
+    describe "Session state"
+        [ test "Guest is the initial unauthenticated state" <|
+            \() ->
+                Expect.equal "Guest" (sessionToString Guest)
+        , test "Authenticating represents in-progress auth" <|
+            \() ->
+                Expect.equal "Authenticating" (sessionToString Authenticating)
+        , test "login transitions to Authenticated" <|
+            \() ->
+                Expect.equal "Authenticated" (sessionToString (login sampleAuthUser))
+        , test "Expired preserves user data" <|
+            \() ->
+                case Expired sampleAuthUser of
+                    Expired auth ->
+                        Expect.equal "alice" auth.user
+
+                    _ ->
+                        Expect.fail "Expected Expired"
+        ]
+
+
+sessionQueryTests : Test
+sessionQueryTests =
+    describe "Session queries"
+        [ test "isAuthenticated for Guest" <|
+            \() ->
+                Expect.equal False (isAuthenticated Guest)
+        , test "isAuthenticated for Authenticating" <|
+            \() ->
+                Expect.equal False (isAuthenticated Authenticating)
+        , test "isAuthenticated for Authenticated" <|
+            \() ->
+                Expect.equal True (isAuthenticated (Authenticated sampleAuthUser))
+        , test "isAuthenticated for Expired" <|
+            \() ->
+                Expect.equal False (isAuthenticated (Expired sampleAuthUser))
+        , test "getUser from Authenticated" <|
+            \() ->
+                Expect.equal (Just "alice") (getUser (Authenticated sampleAuthUser))
+        , test "getUser from Expired returns user" <|
+            \() ->
+                Expect.equal (Just "alice") (getUser (Expired sampleAuthUser))
+        , test "getUser from Guest" <|
+            \() ->
+                Expect.equal Nothing (getUser Guest)
+        , test "getUser from Authenticating" <|
+            \() ->
+                Expect.equal Nothing (getUser Authenticating)
+        , test "getAccessToken from Authenticated" <|
+            \() ->
+                case getAccessToken (Authenticated sampleAuthUser) of
+                    Just token ->
+                        Expect.equal "at_123" (accessTokenToString token)
+
+                    Nothing ->
+                        Expect.fail "Expected Just"
+        , test "getAccessToken from Expired returns Nothing" <|
+            \() ->
+                Expect.equal Nothing (getAccessToken (Expired sampleAuthUser))
+        , test "getAccessToken from Guest" <|
+            \() ->
+                Expect.equal Nothing (getAccessToken Guest)
+        , test "getAccessToken from Authenticating" <|
+            \() ->
+                Expect.equal Nothing (getAccessToken Authenticating)
+        , test "getAuthenticatedUser from Authenticating" <|
+            \() ->
+                Expect.equal Nothing (getAuthenticatedUser Authenticating)
+        , test "getAuthenticatedUser from Authenticated" <|
+            \() ->
+                case getAuthenticatedUser (Authenticated sampleAuthUser) of
+                    Just auth ->
+                        Expect.equal "alice" auth.user
+
+                    Nothing ->
+                        Expect.fail "Expected Just"
+        , test "getAuthenticatedUser from Guest" <|
+            \() ->
+                Expect.equal Nothing (getAuthenticatedUser Guest)
+        , test "getAuthenticatedUser from Expired" <|
+            \() ->
+                Expect.equal Nothing (getAuthenticatedUser (Expired sampleAuthUser))
+        , test "authenticated user with no refresh token" <|
+            \() ->
+                case getAuthenticatedUser (Authenticated sampleAuthUserNoRefresh) of
+                    Just auth ->
+                        Expect.equal Nothing auth.refreshToken
+
+                    Nothing ->
+                        Expect.fail "Expected Just"
+        , test "authenticated user scopes" <|
+            \() ->
+                case getAuthenticatedUser (Authenticated sampleAuthUser) of
+                    Just auth ->
+                        Expect.equal [ "openid", "profile" ] auth.scopes
+
+                    Nothing ->
+                        Expect.fail "Expected Just"
+        ]
+
+
+expiryTests : Test
+expiryTests =
+    describe "Expiry"
+        [ test "isExpired returns False for Guest" <|
+            \() ->
+                Expect.equal False (isExpired (Time.millisToPosix 0) Guest)
+        , test "isExpired returns False for Authenticating" <|
+            \() ->
+                Expect.equal False (isExpired (Time.millisToPosix 0) Authenticating)
+        , test "isExpired returns True for Expired" <|
+            \() ->
+                Expect.equal True (isExpired (Time.millisToPosix 0) (Expired sampleAuthUser))
+        , test "isExpired returns False when token is still valid" <|
+            \() ->
+                let
+                    now =
+                        Time.millisToPosix 1699999999000
+                in
+                Expect.equal False (isExpired now (Authenticated sampleAuthUser))
+        , test "isExpired returns True when token has expired" <|
+            \() ->
+                let
+                    now =
+                        Time.millisToPosix 1700000001000
+                in
+                Expect.equal True (isExpired now (Authenticated sampleAuthUser))
+        , test "isExpired returns True at exact expiry time" <|
+            \() ->
+                let
+                    now =
+                        Time.millisToPosix 1700000000000
+                in
+                Expect.equal True (isExpired now (Authenticated sampleAuthUser))
+        , test "isExpiringSoon returns False for Guest" <|
+            \() ->
+                let
+                    config =
+                        { tokenEndpoint = "", refreshBuffer = 300, storage = MemoryOnly }
+                in
+                Expect.equal False (isExpiringSoon config (Time.millisToPosix 0) Guest)
+        , test "isExpiringSoon returns False for Authenticating" <|
+            \() ->
+                let
+                    config =
+                        { tokenEndpoint = "", refreshBuffer = 300, storage = MemoryOnly }
+                in
+                Expect.equal False (isExpiringSoon config (Time.millisToPosix 0) Authenticating)
+        , test "isExpiringSoon returns True for Expired" <|
+            \() ->
+                let
+                    config =
+                        { tokenEndpoint = "", refreshBuffer = 300, storage = MemoryOnly }
+                in
+                Expect.equal True (isExpiringSoon config (Time.millisToPosix 0) (Expired sampleAuthUser))
+        , test "isExpiringSoon returns True within buffer" <|
+            \() ->
+                let
+                    config =
+                        { tokenEndpoint = "", refreshBuffer = 300, storage = MemoryOnly }
+
+                    now =
+                        Time.millisToPosix (1700000000000 - 200000)
+                in
+                Expect.equal True (isExpiringSoon config now (Authenticated sampleAuthUser))
+        , test "isExpiringSoon returns False outside buffer" <|
+            \() ->
+                let
+                    config =
+                        { tokenEndpoint = "", refreshBuffer = 300, storage = MemoryOnly }
+
+                    now =
+                        Time.millisToPosix (1700000000000 - 400000)
+                in
+                Expect.equal False (isExpiringSoon config now (Authenticated sampleAuthUser))
+        ]
+
+
+mapSessionTests : Test
+mapSessionTests =
+    describe "mapSession"
+        [ test "maps Guest to Guest" <|
+            \() ->
+                Expect.equal "Guest" (sessionToString (mapSession String.toUpper Guest))
+        , test "maps Authenticating to Authenticating" <|
+            \() ->
+                Expect.equal "Authenticating" (sessionToString (mapSession String.toUpper Authenticating))
+        , test "maps user in Authenticated" <|
+            \() ->
+                case mapSession String.length (Authenticated sampleAuthUser) of
+                    Authenticated auth ->
+                        Expect.equal 5 auth.user
+
+                    _ ->
+                        Expect.fail "Expected Authenticated"
+        , test "maps user in Expired" <|
+            \() ->
+                case mapSession String.length (Expired sampleAuthUser) of
+                    Expired auth ->
+                        Expect.equal 5 auth.user
+
+                    _ ->
+                        Expect.fail "Expected Expired"
+        , test "preserves tokens after mapping" <|
+            \() ->
+                case mapSession String.length (Authenticated sampleAuthUser) of
+                    Authenticated auth ->
+                        Expect.equal "at_123" (accessTokenToString auth.accessToken)
+
+                    _ ->
+                        Expect.fail "Expected Authenticated"
+        , test "preserves scopes after mapping" <|
+            \() ->
+                case mapSession String.length (Authenticated sampleAuthUser) of
+                    Authenticated auth ->
+                        Expect.equal [ "openid", "profile" ] auth.scopes
+
+                    _ ->
+                        Expect.fail "Expected Authenticated"
+        ]
+
+
+sessionToStringTests : Test
+sessionToStringTests =
+    describe "sessionToString"
+        [ test "Guest" <|
+            \() ->
+                Expect.equal "Guest" (sessionToString Guest)
+        , test "Authenticating" <|
+            \() ->
+                Expect.equal "Authenticating" (sessionToString Authenticating)
+        , test "Authenticated" <|
+            \() ->
+                Expect.equal "Authenticated" (sessionToString (Authenticated sampleAuthUser))
+        , test "Expired" <|
+            \() ->
+                Expect.equal "Expired" (sessionToString (Expired sampleAuthUser))
+        ]

@@ -1,0 +1,393 @@
+module Auth.Jwt exposing
+    ( DecodedJwt
+    , JwtHeader
+    , JwtPayload
+    , JwtError(..)
+    , decode
+    , decodePayload
+    , decodePayloadWith
+    , isExpired
+    , isExpiredWithBuffer
+    , expiresAt
+    , getClaim
+    , getSubject
+    , headerDecoder
+    , payloadDecoder
+    , jwtErrorToString
+    )
+
+
+{-| JWT decoding without signature verification.
+
+Extracts header and payload from a JWT string by base64url-decoding
+the first two segments and parsing them as JSON. The signature segment
+is preserved as-is for passing to a server that performs verification.
+
+**Security note:** This module intentionally does not verify signatures.
+JWTs decoded here should only be used for display and routing decisions.
+All authorization decisions must be made server-side.
+
+# Types
+
+@docs DecodedJwt, JwtHeader, JwtPayload, JwtError
+
+# Decoding
+
+@docs decode, decodePayload, decodePayloadWith
+
+# Expiry
+
+@docs isExpired, isExpiredWithBuffer, expiresAt
+
+# Claims
+
+@docs getClaim, getSubject
+
+# Decoders
+
+@docs headerDecoder, payloadDecoder
+
+# Errors
+
+@docs jwtErrorToString
+
+-}
+
+
+foreign import javascript "external/auth.js" as AuthFFI
+
+import Dict exposing (Dict)
+import Json.Decode
+import Time
+
+
+
+-- TYPES
+
+
+{-| A decoded JWT with header, payload, and raw signature.
+
+The signature is not verified -- it is preserved so it can be
+forwarded to a server for verification if needed.
+-}
+type alias DecodedJwt =
+    { header : JwtHeader
+    , payload : JwtPayload
+    , signature : String
+    }
+
+
+{-| The JWT header (JOSE header).
+
+Contains the signing algorithm, optional type indicator, and optional
+key ID for key rotation scenarios.
+-}
+type alias JwtHeader =
+    { alg : String
+    , typ : Maybe String
+    , kid : Maybe String
+    }
+
+
+{-| Standard JWT claims (RFC 7519) plus custom claims.
+
+Standard claims are extracted into dedicated fields. All claims
+(including standard ones) are also available in the `claims` dict
+for uniform access.
+-}
+type alias JwtPayload =
+    { iss : Maybe String
+    , sub : Maybe String
+    , aud : Maybe String
+    , exp : Maybe Int
+    , nbf : Maybe Int
+    , iat : Maybe Int
+    , jti : Maybe String
+    , claims : Dict String Json.Decode.Value
+    }
+
+
+{-| Errors that can occur during JWT decoding.
+
+- `InvalidFormat` -- the string does not have exactly three dot-separated segments
+- `Base64DecodeError` -- a segment is not valid base64url
+- `JsonDecodeError` -- a segment is not valid JSON
+-}
+type JwtError
+    = InvalidFormat
+    | Base64DecodeError
+    | JsonDecodeError String
+
+
+
+-- DECODING
+
+
+{-| Decode a JWT string into its header, payload, and signature.
+
+Splits on `.`, base64url-decodes the header and payload segments,
+and parses them as JSON. The signature is preserved as the raw
+third segment.
+
+    decode "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature"
+    -- Ok { header = { alg = "RS256", ... }, payload = { sub = Just "1234567890", ... }, signature = "signature" }
+
+-}
+decode : String -> Result JwtError DecodedJwt
+decode token =
+    case splitToken token of
+        Nothing ->
+            Err InvalidFormat
+
+        Just ( headerB64, payloadB64, sig ) ->
+            decodeSegments headerB64 payloadB64 sig
+
+
+decodeSegments : String -> String -> String -> Result JwtError DecodedJwt
+decodeSegments headerB64 payloadB64 sig =
+    case AuthFFI.base64UrlDecode headerB64 of
+        Err _ ->
+            Err Base64DecodeError
+
+        Ok headerJson ->
+            case Json.Decode.decodeString headerDecoder headerJson of
+                Err decErr ->
+                    Err (JsonDecodeError (Json.Decode.errorToString decErr))
+
+                Ok header ->
+                    decodePayloadSegment header payloadB64 sig
+
+
+decodePayloadSegment : JwtHeader -> String -> String -> Result JwtError DecodedJwt
+decodePayloadSegment header payloadB64 sig =
+    case AuthFFI.base64UrlDecode payloadB64 of
+        Err _ ->
+            Err Base64DecodeError
+
+        Ok payloadJson ->
+            case Json.Decode.decodeString payloadDecoder payloadJson of
+                Err decErr ->
+                    Err (JsonDecodeError (Json.Decode.errorToString decErr))
+
+                Ok payload ->
+                    Ok { header = header, payload = payload, signature = sig }
+
+
+{-| Decode only the payload from a JWT string.
+
+This is the most common use case: extract claims for display or
+routing without needing the header or signature.
+-}
+decodePayload : String -> Result JwtError JwtPayload
+decodePayload token =
+    case decode token of
+        Ok jwt ->
+            Ok jwt.payload
+
+        Err err ->
+            Err err
+
+
+{-| Decode the payload using a custom JSON decoder.
+
+Useful for extracting application-specific claims into a custom type.
+
+    type alias User = { name : String, email : String }
+
+    userDecoder : Json.Decode.Decoder User
+    userDecoder =
+        Json.Decode.map2 User
+            (Json.Decode.field "name" Json.Decode.string)
+            (Json.Decode.field "email" Json.Decode.string)
+
+    decodePayloadWith userDecoder jwtString
+
+-}
+decodePayloadWith : Json.Decode.Decoder a -> String -> Result JwtError a
+decodePayloadWith decoder token =
+    case splitToken token of
+        Nothing ->
+            Err InvalidFormat
+
+        Just ( _, payloadB64, _ ) ->
+            decodePayloadWithDecoder decoder payloadB64
+
+
+decodePayloadWithDecoder : Json.Decode.Decoder a -> String -> Result JwtError a
+decodePayloadWithDecoder decoder payloadB64 =
+    case AuthFFI.base64UrlDecode payloadB64 of
+        Err _ ->
+            Err Base64DecodeError
+
+        Ok payloadJson ->
+            case Json.Decode.decodeString decoder payloadJson of
+                Err decErr ->
+                    Err (JsonDecodeError (Json.Decode.errorToString decErr))
+
+                Ok value ->
+                    Ok value
+
+
+
+-- EXPIRY
+
+
+{-| Check if a JWT payload is expired at the given time.
+
+Returns `False` if there is no `exp` claim (the token never expires).
+-}
+isExpired : Time.Posix -> JwtPayload -> Bool
+isExpired now payload =
+    case payload.exp of
+        Nothing ->
+            False
+
+        Just exp ->
+            let
+                nowSeconds =
+                    Time.posixToMillis now // 1000
+            in
+            nowSeconds >= exp
+
+
+{-| Check if a JWT payload is expired with a buffer period.
+
+Returns `True` if the token will expire within `buffer` seconds of
+the given time. Useful for triggering proactive refresh.
+-}
+isExpiredWithBuffer : Int -> Time.Posix -> JwtPayload -> Bool
+isExpiredWithBuffer buffer now payload =
+    case payload.exp of
+        Nothing ->
+            False
+
+        Just exp ->
+            let
+                nowSeconds =
+                    Time.posixToMillis now // 1000
+            in
+            nowSeconds + buffer >= exp
+
+
+{-| Get the expiration time as a Posix timestamp.
+
+Returns `Nothing` if there is no `exp` claim.
+-}
+expiresAt : JwtPayload -> Maybe Time.Posix
+expiresAt payload =
+    case payload.exp of
+        Nothing ->
+            Nothing
+
+        Just exp ->
+            Just (Time.millisToPosix (exp * 1000))
+
+
+
+-- CLAIMS
+
+
+{-| Extract a specific claim value using a JSON decoder.
+
+Looks up the claim by name in the `claims` dict and attempts to
+decode it with the provided decoder.
+
+    getClaim "email" Json.Decode.string payload
+    -- Just "user@example.com"
+
+-}
+getClaim : String -> Json.Decode.Decoder a -> JwtPayload -> Maybe a
+getClaim name decoder payload =
+    case Dict.get name payload.claims of
+        Nothing ->
+            Nothing
+
+        Just value ->
+            case Json.Decode.decodeValue decoder value of
+                Ok decoded ->
+                    Just decoded
+
+                Err _ ->
+                    Nothing
+
+
+{-| Get the subject (`sub`) claim, which is typically the user ID. -}
+getSubject : JwtPayload -> Maybe String
+getSubject payload =
+    payload.sub
+
+
+
+-- DECODERS
+
+
+{-| JSON decoder for JWT headers. -}
+headerDecoder : Json.Decode.Decoder JwtHeader
+headerDecoder =
+    Json.Decode.map3 JwtHeader
+        (Json.Decode.field "alg" Json.Decode.string)
+        (Json.Decode.maybe (Json.Decode.field "typ" Json.Decode.string))
+        (Json.Decode.maybe (Json.Decode.field "kid" Json.Decode.string))
+
+
+{-| JSON decoder for JWT payloads.
+
+Extracts standard claims into dedicated fields and collects all
+claims (including standard ones) into the `claims` dict.
+-}
+payloadDecoder : Json.Decode.Decoder JwtPayload
+payloadDecoder =
+    Json.Decode.map8 buildPayload
+        (Json.Decode.maybe (Json.Decode.field "iss" Json.Decode.string))
+        (Json.Decode.maybe (Json.Decode.field "sub" Json.Decode.string))
+        (Json.Decode.maybe (Json.Decode.field "aud" Json.Decode.string))
+        (Json.Decode.maybe (Json.Decode.field "exp" Json.Decode.int))
+        (Json.Decode.maybe (Json.Decode.field "nbf" Json.Decode.int))
+        (Json.Decode.maybe (Json.Decode.field "iat" Json.Decode.int))
+        (Json.Decode.maybe (Json.Decode.field "jti" Json.Decode.string))
+        (Json.Decode.dict Json.Decode.value)
+
+
+buildPayload : Maybe String -> Maybe String -> Maybe String -> Maybe Int -> Maybe Int -> Maybe Int -> Maybe String -> Dict String Json.Decode.Value -> JwtPayload
+buildPayload iss sub aud exp nbf iat jti claims =
+    { iss = iss
+    , sub = sub
+    , aud = aud
+    , exp = exp
+    , nbf = nbf
+    , iat = iat
+    , jti = jti
+    , claims = claims
+    }
+
+
+
+-- ERRORS
+
+
+{-| Convert a JWT error to a human-readable string. -}
+jwtErrorToString : JwtError -> String
+jwtErrorToString err =
+    case err of
+        InvalidFormat ->
+            "Invalid JWT format: expected three dot-separated segments"
+
+        Base64DecodeError ->
+            "Failed to base64url-decode JWT segment"
+
+        JsonDecodeError reason ->
+            "Failed to decode JWT JSON: " ++ reason
+
+
+
+-- INTERNAL HELPERS
+
+
+splitToken : String -> Maybe ( String, String, String )
+splitToken token =
+    case String.split "." token of
+        [ header, payload, sig ] ->
+            Just ( header, payload, sig )
+
+        _ ->
+            Nothing

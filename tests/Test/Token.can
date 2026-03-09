@@ -1,0 +1,367 @@
+module Test.Token exposing (main, tests)
+
+import Basics exposing (..)
+import Auth exposing (accessToken, accessTokenToString, StorageStrategy(..))
+import Auth.Token exposing (..)
+import Expect
+import Http
+import Json.Decode
+import Json.Encode
+import Maybe exposing (Maybe(..))
+import Result exposing (Result(..))
+import Test exposing (..)
+
+
+main : Test
+main =
+    tests
+
+
+tests : Test
+tests =
+    describe "Auth.Token"
+        [ tokenResponseDecoderTests
+        , bearerHeaderTests
+        , parseScopesTests
+        , refreshErrorToStringTests
+        , storedTokensTests
+        , storedTokensEncoderTests
+        , storedTokensDecoderTests
+        , storageStrategyToIntTests
+        ]
+
+
+tokenResponseDecoderTests : Test
+tokenResponseDecoderTests =
+    describe "tokenResponseDecoder"
+        [ test "decodes complete response" <|
+            \() ->
+                let
+                    json =
+                        "{\"access_token\":\"at_123\",\"refresh_token\":\"rt_456\",\"expires_in\":3600,\"token_type\":\"Bearer\",\"scope\":\"openid profile\"}"
+                in
+                case Json.Decode.decodeString tokenResponseDecoder json of
+                    Ok resp ->
+                        Expect.all
+                            [ \r -> Expect.equal "at_123" r.accessToken
+                            , \r -> Expect.equal (Just "rt_456") r.refreshToken
+                            , \r -> Expect.equal 3600 r.expiresIn
+                            , \r -> Expect.equal "Bearer" r.tokenType
+                            , \r -> Expect.equal (Just "openid profile") r.scope
+                            ]
+                            resp
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ Json.Decode.errorToString err)
+        , test "decodes response without refresh token" <|
+            \() ->
+                let
+                    json =
+                        "{\"access_token\":\"at_789\",\"expires_in\":1800,\"token_type\":\"Bearer\"}"
+                in
+                case Json.Decode.decodeString tokenResponseDecoder json of
+                    Ok resp ->
+                        Expect.all
+                            [ \r -> Expect.equal "at_789" r.accessToken
+                            , \r -> Expect.equal Nothing r.refreshToken
+                            , \r -> Expect.equal 1800 r.expiresIn
+                            , \r -> Expect.equal Nothing r.scope
+                            ]
+                            resp
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ Json.Decode.errorToString err)
+        , test "decodes response without token_type (defaults to Bearer)" <|
+            \() ->
+                let
+                    json =
+                        "{\"access_token\":\"at_abc\",\"expires_in\":600}"
+                in
+                case Json.Decode.decodeString tokenResponseDecoder json of
+                    Ok resp ->
+                        Expect.equal "Bearer" resp.tokenType
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ Json.Decode.errorToString err)
+        , test "fails without access_token" <|
+            \() ->
+                let
+                    json =
+                        "{\"expires_in\":3600,\"token_type\":\"Bearer\"}"
+                in
+                case Json.Decode.decodeString tokenResponseDecoder json of
+                    Err _ ->
+                        Expect.pass
+
+                    Ok _ ->
+                        Expect.fail "Expected Err"
+        , test "fails without expires_in" <|
+            \() ->
+                let
+                    json =
+                        "{\"access_token\":\"at_123\",\"token_type\":\"Bearer\"}"
+                in
+                case Json.Decode.decodeString tokenResponseDecoder json of
+                    Err _ ->
+                        Expect.pass
+
+                    Ok _ ->
+                        Expect.fail "Expected Err"
+        , test "decodes with scope present" <|
+            \() ->
+                let
+                    json =
+                        "{\"access_token\":\"at_123\",\"expires_in\":3600,\"token_type\":\"Bearer\",\"scope\":\"read write\"}"
+                in
+                case Json.Decode.decodeString tokenResponseDecoder json of
+                    Ok resp ->
+                        Expect.equal (Just "read write") resp.scope
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ Json.Decode.errorToString err)
+        ]
+
+
+bearerHeaderTests : Test
+bearerHeaderTests =
+    describe "bearerHeader"
+        [ test "builds correct tuple" <|
+            \() ->
+                let
+                    ( key, value ) =
+                        bearerHeader (accessToken "my_token")
+                in
+                Expect.all
+                    [ \_ -> Expect.equal "Authorization" key
+                    , \_ -> Expect.equal "Bearer my_token" value
+                    ]
+                    ()
+        , test "handles empty token" <|
+            \() ->
+                let
+                    ( _, value ) =
+                        bearerHeader (accessToken "")
+                in
+                Expect.equal "Bearer " value
+        , test "handles token with special characters" <|
+            \() ->
+                let
+                    ( _, value ) =
+                        bearerHeader (accessToken "eyJhbGciOiJSUzI1NiJ9.payload.sig")
+                in
+                Expect.equal "Bearer eyJhbGciOiJSUzI1NiJ9.payload.sig" value
+        ]
+
+
+parseScopesTests : Test
+parseScopesTests =
+    describe "parseScopes"
+        [ test "parses space-separated scopes" <|
+            \() ->
+                Expect.equal [ "openid", "profile", "email" ] (parseScopes (Just "openid profile email"))
+        , test "parses single scope" <|
+            \() ->
+                Expect.equal [ "read" ] (parseScopes (Just "read"))
+        , test "returns empty list for Nothing" <|
+            \() ->
+                Expect.equal [] (parseScopes Nothing)
+        , test "returns empty list for empty string" <|
+            \() ->
+                Expect.equal [] (parseScopes (Just ""))
+        ]
+
+
+refreshErrorToStringTests : Test
+refreshErrorToStringTests =
+    describe "refreshErrorToString"
+        [ test "RefreshDenied" <|
+            \() ->
+                Expect.equal True (String.contains "denied" (refreshErrorToString (RefreshDenied "revoked")))
+        , test "RefreshDecodeError" <|
+            \() ->
+                Expect.equal True (String.contains "decode" (refreshErrorToString (RefreshDecodeError "bad json")))
+        , test "RefreshNetworkError" <|
+            \() ->
+                Expect.equal True (String.contains "Network" (refreshErrorToString (RefreshNetworkError Http.Timeout)))
+        ]
+
+
+storedTokensTests : Test
+storedTokensTests =
+    describe "StoredTokens"
+        [ test "record with all fields" <|
+            \() ->
+                let
+                    tokens =
+                        { accessToken = "at_123"
+                        , refreshToken = Just "rt_456"
+                        , expiresAt = 1700000000
+                        }
+                in
+                Expect.all
+                    [ \t -> Expect.equal "at_123" t.accessToken
+                    , \t -> Expect.equal (Just "rt_456") t.refreshToken
+                    , \t -> Expect.equal 1700000000 t.expiresAt
+                    ]
+                    tokens
+        , test "record without refresh token" <|
+            \() ->
+                let
+                    tokens =
+                        { accessToken = "at_789"
+                        , refreshToken = Nothing
+                        , expiresAt = 1700000000
+                        }
+                in
+                Expect.equal Nothing tokens.refreshToken
+        ]
+
+
+storedTokensEncoderTests : Test
+storedTokensEncoderTests =
+    describe "storedTokensEncoder"
+        [ test "encodes tokens with refresh token" <|
+            \() ->
+                let
+                    tokens =
+                        { accessToken = "at_123"
+                        , refreshToken = Just "rt_456"
+                        , expiresAt = 1700000000
+                        }
+
+                    encoded =
+                        Json.Encode.encode 0 (storedTokensEncoder tokens)
+                in
+                Expect.all
+                    [ \s -> Expect.equal True (String.contains "\"accessToken\":\"at_123\"" s)
+                    , \s -> Expect.equal True (String.contains "\"refreshToken\":\"rt_456\"" s)
+                    , \s -> Expect.equal True (String.contains "\"expiresAt\":1700000000" s)
+                    ]
+                    encoded
+        , test "encodes tokens without refresh token" <|
+            \() ->
+                let
+                    tokens =
+                        { accessToken = "at_789"
+                        , refreshToken = Nothing
+                        , expiresAt = 1700000000
+                        }
+
+                    encoded =
+                        Json.Encode.encode 0 (storedTokensEncoder tokens)
+                in
+                Expect.all
+                    [ \s -> Expect.equal True (String.contains "\"accessToken\":\"at_789\"" s)
+                    , \s -> Expect.equal True (String.contains "\"refreshToken\":null" s)
+                    ]
+                    encoded
+        ]
+
+
+storedTokensDecoderTests : Test
+storedTokensDecoderTests =
+    describe "storedTokensDecoder"
+        [ test "decodes tokens with refresh token" <|
+            \() ->
+                let
+                    json =
+                        "{\"accessToken\":\"at_123\",\"refreshToken\":\"rt_456\",\"expiresAt\":1700000000}"
+                in
+                case Json.Decode.decodeString storedTokensDecoder json of
+                    Ok tokens ->
+                        Expect.all
+                            [ \t -> Expect.equal "at_123" t.accessToken
+                            , \t -> Expect.equal (Just "rt_456") t.refreshToken
+                            , \t -> Expect.equal 1700000000 t.expiresAt
+                            ]
+                            tokens
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ Json.Decode.errorToString err)
+        , test "decodes tokens without refresh token" <|
+            \() ->
+                let
+                    json =
+                        "{\"accessToken\":\"at_789\",\"expiresAt\":1700000000}"
+                in
+                case Json.Decode.decodeString storedTokensDecoder json of
+                    Ok tokens ->
+                        Expect.all
+                            [ \t -> Expect.equal "at_789" t.accessToken
+                            , \t -> Expect.equal Nothing t.refreshToken
+                            , \t -> Expect.equal 1700000000 t.expiresAt
+                            ]
+                            tokens
+
+                    Err err ->
+                        Expect.fail ("Expected Ok, got: " ++ Json.Decode.errorToString err)
+        , test "fails on invalid JSON" <|
+            \() ->
+                case Json.Decode.decodeString storedTokensDecoder "{}" of
+                    Err _ ->
+                        Expect.pass
+
+                    Ok _ ->
+                        Expect.fail "Expected Err"
+        , test "roundtrip encode then decode with refresh token" <|
+            \() ->
+                let
+                    original =
+                        { accessToken = "at_roundtrip"
+                        , refreshToken = Just "rt_roundtrip"
+                        , expiresAt = 1234567890
+                        }
+
+                    json =
+                        Json.Encode.encode 0 (storedTokensEncoder original)
+                in
+                case Json.Decode.decodeString storedTokensDecoder json of
+                    Ok decoded ->
+                        Expect.all
+                            [ \t -> Expect.equal original.accessToken t.accessToken
+                            , \t -> Expect.equal original.refreshToken t.refreshToken
+                            , \t -> Expect.equal original.expiresAt t.expiresAt
+                            ]
+                            decoded
+
+                    Err err ->
+                        Expect.fail ("Roundtrip failed: " ++ Json.Decode.errorToString err)
+        , test "roundtrip encode then decode without refresh token" <|
+            \() ->
+                let
+                    original =
+                        { accessToken = "at_norft"
+                        , refreshToken = Nothing
+                        , expiresAt = 9999999
+                        }
+
+                    json =
+                        Json.Encode.encode 0 (storedTokensEncoder original)
+                in
+                case Json.Decode.decodeString storedTokensDecoder json of
+                    Ok decoded ->
+                        Expect.all
+                            [ \t -> Expect.equal original.accessToken t.accessToken
+                            , \t -> Expect.equal Nothing t.refreshToken
+                            , \t -> Expect.equal original.expiresAt t.expiresAt
+                            ]
+                            decoded
+
+                    Err err ->
+                        Expect.fail ("Roundtrip failed: " ++ Json.Decode.errorToString err)
+        ]
+
+
+storageStrategyToIntTests : Test
+storageStrategyToIntTests =
+    describe "storageStrategyToInt"
+        [ test "LocalStorage is 0" <|
+            \() ->
+                Expect.equal 0 (storageStrategyToInt LocalStorage)
+        , test "SessionStorage is 1" <|
+            \() ->
+                Expect.equal 1 (storageStrategyToInt SessionStorage)
+        , test "MemoryOnly is 2" <|
+            \() ->
+                Expect.equal 2 (storageStrategyToInt MemoryOnly)
+        ]
