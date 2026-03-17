@@ -30,6 +30,6 @@
         "canopy/http": "2.0.0 <= v < 3.0.0"
     },
     "test-dependencies": {
-        "canopy/test": "1.0.0 <= v < 2.0.0"
+        "canopy/test": "1.0.0 <= v < 3.0.0"
     }
 }
