@@ -118,9 +118,26 @@ var generateRandomState = function(_v0) {
 
 
 // TOKEN STORAGE
+//
+// Security model:
+//   - Access tokens: ALWAYS stored in memory only (never localStorage/sessionStorage).
+//     XSS cannot read them; they are lost on page unload (intended).
+//   - Refresh tokens: May use localStorage or sessionStorage per the caller's strategy.
+//     These are longer-lived and may survive page reloads as designed.
+//
+// Strategy tags: 0=localStorage, 1=sessionStorage, 2=memoryOnly
 
-var _Auth_storageKey = '__canopy_auth_tokens';
-var _Auth_memoryStore = {};
+var _Auth_accessTokenKey = '__canopy_auth_access';
+var _Auth_refreshTokenKey = '__canopy_auth_refresh';
+var _Auth_accessMemory = null;  // in-memory access token storage
+
+// Clear in-memory access token when the tab closes so it does not persist
+// across sessions even accidentally (e.g., via bfcache restoration).
+if (typeof window !== 'undefined') {
+    window.addEventListener('beforeunload', function() {
+        _Auth_accessMemory = null;
+    });
+}
 
 function _Auth_getStorageObj(tag) {
     if (tag === 'LocalStorage' || tag === 0) {
@@ -134,43 +151,97 @@ function _Auth_getStorageObj(tag) {
 
 
 /**
- * Save a JSON string to the configured storage area.
- * Tag: 0=localStorage, 1=sessionStorage, 2=memoryOnly
+ * Save an access token JSON string. Always stored in memory, never
+ * in localStorage or sessionStorage, to prevent XSS exfiltration.
  *
- * @canopy-type Int -> String -> Task Never ()
- * @name saveTokenString
+ * @canopy-type String -> Task Never ()
+ * @name saveAccessToken
  */
-var saveTokenString = F2(function(strategyTag, jsonStr) {
+var saveAccessToken = function(jsonStr) {
+    return _Scheduler_binding(function(callback) {
+        _Auth_accessMemory = jsonStr;
+        callback(_Scheduler_succeed(_Utils_Tuple0));
+    });
+};
+
+
+/**
+ * Load the access token JSON string from memory.
+ *
+ * @canopy-type () -> Task Never (Maybe String)
+ * @name loadAccessToken
+ */
+var loadAccessToken = function(_v0) {
+    return _Scheduler_binding(function(callback) {
+        if (_Auth_accessMemory === null || _Auth_accessMemory === undefined) {
+            callback(_Scheduler_succeed(_Maybe_Nothing));
+        } else {
+            callback(_Scheduler_succeed(_Maybe_Just(_Auth_accessMemory)));
+        }
+    });
+};
+
+
+/**
+ * Clear the in-memory access token.
+ *
+ * @canopy-type () -> Task Never ()
+ * @name clearAccessToken
+ */
+var clearAccessToken = function(_v0) {
+    return _Scheduler_binding(function(callback) {
+        _Auth_accessMemory = null;
+        callback(_Scheduler_succeed(_Utils_Tuple0));
+    });
+};
+
+
+/**
+ * Save a refresh token JSON string to the configured persistent storage.
+ * Tag: 0=localStorage, 1=sessionStorage, 2=memoryOnly.
+ * Returns Err "QuotaExceeded" if storage quota is exceeded.
+ *
+ * @canopy-type Int -> String -> Task String ()
+ * @name saveRefreshToken
+ */
+var saveRefreshToken = F2(function(strategyTag, jsonStr) {
     return _Scheduler_binding(function(callback) {
         var storage = _Auth_getStorageObj(strategyTag);
         if (storage) {
-            try { storage.setItem(_Auth_storageKey, jsonStr); }
-            catch (e) { /* quota exceeded */ }
+            try {
+                storage.setItem(_Auth_refreshTokenKey, jsonStr);
+                callback(_Scheduler_succeed(_Utils_Tuple0));
+            } catch (e) {
+                if (e && e.name === 'QuotaExceededError') {
+                    callback(_Scheduler_fail('QuotaExceeded'));
+                } else {
+                    callback(_Scheduler_fail(e ? e.message : 'StorageError'));
+                }
+            }
         } else {
-            _Auth_memoryStore[_Auth_storageKey] = jsonStr;
+            // MemoryOnly strategy for refresh token: use memory store
+            _Auth_accessMemory = jsonStr;
+            callback(_Scheduler_succeed(_Utils_Tuple0));
         }
-        callback(_Scheduler_succeed(_Utils_Tuple0));
     });
 });
 
 
 /**
- * Load a JSON string from the configured storage area.
+ * Load a refresh token JSON string from the configured persistent storage.
  *
  * @canopy-type Int -> Task Never (Maybe String)
- * @name loadTokenString
+ * @name loadRefreshToken
  */
-var loadTokenString = function(strategyTag) {
+var loadRefreshToken = function(strategyTag) {
     return _Scheduler_binding(function(callback) {
         var storage = _Auth_getStorageObj(strategyTag);
         var json = null;
         if (storage) {
-            try { json = storage.getItem(_Auth_storageKey); }
+            try { json = storage.getItem(_Auth_refreshTokenKey); }
             catch (e) { /* storage unavailable */ }
-        } else {
-            json = _Auth_memoryStore[_Auth_storageKey] || null;
         }
-        if (json === null) {
+        if (json === null || json === undefined) {
             callback(_Scheduler_succeed(_Maybe_Nothing));
         } else {
             callback(_Scheduler_succeed(_Maybe_Just(json)));
@@ -180,20 +251,67 @@ var loadTokenString = function(strategyTag) {
 
 
 /**
- * Clear tokens from the configured storage area.
+ * Clear the refresh token from the configured persistent storage.
  *
  * @canopy-type Int -> Task Never ()
- * @name clearTokenString
+ * @name clearRefreshToken
  */
-var clearTokenString = function(strategyTag) {
+var clearRefreshToken = function(strategyTag) {
     return _Scheduler_binding(function(callback) {
         var storage = _Auth_getStorageObj(strategyTag);
         if (storage) {
-            try { storage.removeItem(_Auth_storageKey); }
+            try { storage.removeItem(_Auth_refreshTokenKey); }
             catch (e) { /* storage unavailable */ }
-        } else {
-            delete _Auth_memoryStore[_Auth_storageKey];
         }
+        callback(_Scheduler_succeed(_Utils_Tuple0));
+    });
+};
+
+
+// Legacy API: kept for backwards compatibility with callers that use the
+// old unified saveTokenString / loadTokenString / clearTokenString API.
+// These now store the payload in memory only regardless of strategy tag,
+// matching the secure default. Callers should migrate to the split API.
+
+var _Auth_legacyMemory = null;
+
+/**
+ * @canopy-type Int -> String -> Task Never ()
+ * @name saveTokenString
+ * @deprecated Use saveAccessToken and saveRefreshToken instead.
+ */
+var saveTokenString = F2(function(strategyTag, jsonStr) {
+    return _Scheduler_binding(function(callback) {
+        _Auth_legacyMemory = jsonStr;
+        callback(_Scheduler_succeed(_Utils_Tuple0));
+    });
+});
+
+
+/**
+ * @canopy-type Int -> Task Never (Maybe String)
+ * @name loadTokenString
+ * @deprecated Use loadAccessToken and loadRefreshToken instead.
+ */
+var loadTokenString = function(strategyTag) {
+    return _Scheduler_binding(function(callback) {
+        if (_Auth_legacyMemory === null || _Auth_legacyMemory === undefined) {
+            callback(_Scheduler_succeed(_Maybe_Nothing));
+        } else {
+            callback(_Scheduler_succeed(_Maybe_Just(_Auth_legacyMemory)));
+        }
+    });
+};
+
+
+/**
+ * @canopy-type Int -> Task Never ()
+ * @name clearTokenString
+ * @deprecated Use clearAccessToken and clearRefreshToken instead.
+ */
+var clearTokenString = function(strategyTag) {
+    return _Scheduler_binding(function(callback) {
+        _Auth_legacyMemory = null;
         callback(_Scheduler_succeed(_Utils_Tuple0));
     });
 };

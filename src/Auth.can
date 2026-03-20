@@ -27,6 +27,30 @@ Models authentication as a state machine with explicit transitions.
 Tokens are wrapped in opaque types to prevent accidental misuse
 (e.g., using a refresh token where an access token is expected).
 
+
+# Token Storage Model
+
+**Access tokens are stored in memory only** (JavaScript module-level variable).
+They are never written to `localStorage` or `sessionStorage`, so they cannot
+be exfiltrated by XSS attacks that read storage. Access tokens are lost when
+the tab is closed.
+
+**Refresh tokens are stored in `localStorage`** (when `StorePersistent` is
+used). This is an intentional trade-off: refresh tokens are longer-lived and
+their loss on tab close would force re-authentication on every visit, degrading
+UX. Refresh token theft via XSS is still possible if your CSP is weak — ensure
+a strict `Content-Security-Policy` header on your server.
+
+**HTTPS is required** for the PKCE flow and for session security in general.
+On plain HTTP origins, the browser may allow the OAuth redirect but tokens
+in memory are still visible to any JS running on the same origin.
+
+**Tab close clears in-memory tokens.** A `beforeunload` listener clears the
+in-memory access token when the tab closes. On browser crash or forced close,
+the token is lost (this is acceptable; the refresh token in localStorage will
+be used to re-authenticate on the next visit).
+
+
 # Session State
 
 @docs Session, AuthenticatedUser
