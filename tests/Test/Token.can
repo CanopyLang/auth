@@ -365,3 +365,5 @@ storageStrategyToIntTests =
             \() ->
                 Expect.equal 2 (storageStrategyToInt MemoryOnly)
         ]
+
+

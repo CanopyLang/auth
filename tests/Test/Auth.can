@@ -23,6 +23,7 @@ tests =
         , expiryTests
         , mapSessionTests
         , sessionToStringTests
+        , logoutTests
         ]
 
 
@@ -322,4 +323,28 @@ sessionToStringTests =
         , test "Expired" <|
             \() ->
                 Expect.equal "Expired" (sessionToString (Expired sampleAuthUser))
+        ]
+
+
+logoutTests : Test
+logoutTests =
+    describe "logout"
+        [ test "logout from Authenticated returns Guest" <|
+            \() ->
+                Expect.equal Guest (logout (Authenticated sampleAuthUser))
+        , test "logout from Expired returns Guest" <|
+            \() ->
+                Expect.equal Guest (logout (Expired sampleAuthUser))
+        , test "logout from Authenticating returns Guest" <|
+            \() ->
+                Expect.equal Guest (logout Authenticating)
+        , test "logout from Guest returns Guest" <|
+            \() ->
+                Expect.equal Guest (logout Guest)
+        , test "logout clears user data by returning Guest" <|
+            \() ->
+                Expect.equal Nothing (getUser (logout (Authenticated sampleAuthUser)))
+        , test "logout clears access token by returning Guest" <|
+            \() ->
+                Expect.equal Nothing (getAccessToken (logout (Authenticated sampleAuthUser)))
         ]

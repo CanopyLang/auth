@@ -2,11 +2,15 @@ module Test.OAuth exposing (main, tests)
 
 import Basics exposing (..)
 import Auth.OAuth exposing (..)
+import Auth.Token exposing (TokenResponse)
 import Dict
 import Expect
+import Http
 import Maybe exposing (Maybe(..))
 import Result exposing (Result(..))
+import Task
 import Test exposing (..)
+import Test exposing (TestError(..))
 import Url
 
 
@@ -24,6 +28,8 @@ tests =
         , validateStateTests
         , queryStringTests
         , oauthErrorToStringTests
+        , pkceTypeTests
+        , exchangeCodeTests
         ]
 
 
@@ -480,4 +486,202 @@ oauthErrorToStringTests =
         , test "PkceError" <|
             \() ->
                 Expect.equal True (String.contains "PKCE" (oauthErrorToString (PkceError "crypto unavailable")))
+        ]
+
+
+pkceTypeTests : Test
+pkceTypeTests =
+    describe "PkceChallenge type"
+        [ test "codeVerifier field contains expected value" <|
+            \() ->
+                Expect.equal "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk" samplePkce.codeVerifier
+        , test "codeChallenge field contains expected value" <|
+            \() ->
+                Expect.equal "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM" samplePkce.codeChallenge
+        , test "codeChallengeMethod is S256" <|
+            \() ->
+                Expect.equal "S256" samplePkce.codeChallengeMethod
+        , test "authorizationUrl includes code_challenge parameter" <|
+            \() ->
+                Expect.equal True
+                    (String.contains
+                        ("code_challenge=" ++ samplePkce.codeChallenge)
+                        (authorizationUrl googleConfig sampleAuthRequest)
+                    )
+        , test "authorizationUrl includes code_challenge_method=S256" <|
+            \() ->
+                Expect.equal True
+                    (String.contains
+                        "code_challenge_method=S256"
+                        (authorizationUrl googleConfig sampleAuthRequest)
+                    )
+        , asyncTest "generateCodeVerifier returns a 43-character base64url string"
+            (generateCodeVerifier
+                |> Task.mapError (\e -> TestException ("generateCodeVerifier failed: " ++ oauthErrorToString e))
+                |> Task.map
+                    (\verifier ->
+                        Expect.all
+                            [ \v -> Expect.equal 43 (String.length v)
+                            , \v -> Expect.equal True (String.all isBase64UrlChar v)
+                            ]
+                            verifier
+                    )
+            )
+        , asyncTest "generateCodeChallenge produces S256 challenge from verifier"
+            (generateCodeVerifier
+                |> Task.andThen generateCodeChallenge
+                |> Task.mapError (\e -> TestException ("generateCodeChallenge failed: " ++ oauthErrorToString e))
+                |> Task.map
+                    (\pkce ->
+                        Expect.all
+                            [ \p -> Expect.equal "S256" p.codeChallengeMethod
+                            , \p -> Expect.equal False (String.isEmpty p.codeChallenge)
+                            , \p -> Expect.equal False (String.isEmpty p.codeVerifier)
+                            , \p -> Expect.equal 43 (String.length p.codeVerifier)
+                            ]
+                            pkce
+                    )
+            )
+        , asyncTest "generateState returns a 32-character hex string"
+            (generateState
+                |> Task.mapError (\e -> TestException ("generateState failed: " ++ oauthErrorToString e))
+                |> Task.map
+                    (\state ->
+                        Expect.all
+                            [ \s -> Expect.equal 32 (String.length s)
+                            , \s -> Expect.equal True (String.all isHexChar s)
+                            ]
+                            state
+                    )
+            )
+        , asyncTest "successive generateState calls produce different values"
+            (Task.map2 Tuple.pair generateState generateState
+                |> Task.mapError (\e -> TestException ("generateState failed: " ++ oauthErrorToString e))
+                |> Task.map
+                    (\( s1, s2 ) -> Expect.notEqual s1 s2)
+            )
+        ]
+
+
+{-| Check if a character is valid base64url (A-Z, a-z, 0-9, -, _, ~, .)
+as used in PKCE code verifiers.
+-}
+isBase64UrlChar : Char -> Bool
+isBase64UrlChar c =
+    Char.isAlphaNum c || c == '-' || c == '_' || c == '.' || c == '~'
+
+
+{-| Check if a character is a lowercase hex digit. -}
+isHexChar : Char -> Bool
+isHexChar c =
+    (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+
+
+exchangeCodeTests : Test
+exchangeCodeTests =
+    describe "decodeCodeExchangeResponse"
+        [ test "decodes a successful token response" <|
+            \() ->
+                let
+                    json =
+                        "{\"access_token\":\"at_abc\",\"refresh_token\":\"rt_xyz\",\"expires_in\":3600,\"token_type\":\"Bearer\"}"
+
+                    meta =
+                        { url = "https://example.com/token"
+                        , statusCode = 200
+                        , statusText = "OK"
+                        , headers = Dict.empty
+                        }
+                in
+                case decodeCodeExchangeResponse (Http.GoodStatus_ meta json) of
+                    Ok resp ->
+                        Expect.all
+                            [ \r -> Expect.equal "at_abc" r.accessToken
+                            , \r -> Expect.equal (Just "rt_xyz") r.refreshToken
+                            , \r -> Expect.equal 3600 r.expiresIn
+                            ]
+                            resp
+
+                    Err e ->
+                        Expect.fail ("Expected Ok, got error: " ++ oauthErrorToString e)
+        , test "returns CodeExchangeError for HTTP 401" <|
+            \() ->
+                let
+                    meta =
+                        { url = "https://example.com/token"
+                        , statusCode = 401
+                        , statusText = "Unauthorized"
+                        , headers = Dict.empty
+                        }
+                in
+                case decodeCodeExchangeResponse (Http.BadStatus_ meta "") of
+                    Err (CodeExchangeError msg) ->
+                        Expect.equal True (String.contains "401" msg)
+
+                    _ ->
+                        Expect.fail "Expected CodeExchangeError"
+        , test "returns CodeExchangeError for HTTP 400 invalid_grant" <|
+            \() ->
+                let
+                    meta =
+                        { url = "https://example.com/token"
+                        , statusCode = 400
+                        , statusText = "Bad Request"
+                        , headers = Dict.empty
+                        }
+                in
+                case decodeCodeExchangeResponse (Http.BadStatus_ meta "{\"error\":\"invalid_grant\"}") of
+                    Err (CodeExchangeError msg) ->
+                        Expect.equal True (String.contains "400" msg)
+
+                    _ ->
+                        Expect.fail "Expected CodeExchangeError"
+        , test "returns CodeExchangeError on timeout" <|
+            \() ->
+                case decodeCodeExchangeResponse Http.Timeout_ of
+                    Err (CodeExchangeError msg) ->
+                        Expect.equal True (String.contains "timed out" msg)
+
+                    _ ->
+                        Expect.fail "Expected CodeExchangeError for timeout"
+        , test "returns CodeExchangeError on network error" <|
+            \() ->
+                case decodeCodeExchangeResponse Http.NetworkError_ of
+                    Err (CodeExchangeError msg) ->
+                        Expect.equal True (String.contains "Network" msg)
+
+                    _ ->
+                        Expect.fail "Expected CodeExchangeError for network error"
+        , test "returns TokenDecodeError for malformed JSON" <|
+            \() ->
+                let
+                    meta =
+                        { url = "https://example.com/token"
+                        , statusCode = 200
+                        , statusText = "OK"
+                        , headers = Dict.empty
+                        }
+                in
+                case decodeCodeExchangeResponse (Http.GoodStatus_ meta "not valid json") of
+                    Err (TokenDecodeError _) ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected TokenDecodeError for invalid JSON"
+        , test "returns TokenDecodeError for JSON missing access_token" <|
+            \() ->
+                let
+                    meta =
+                        { url = "https://example.com/token"
+                        , statusCode = 200
+                        , statusText = "OK"
+                        , headers = Dict.empty
+                        }
+                in
+                case decodeCodeExchangeResponse (Http.GoodStatus_ meta "{\"expires_in\":3600}") of
+                    Err (TokenDecodeError _) ->
+                        Expect.pass
+
+                    _ ->
+                        Expect.fail "Expected TokenDecodeError for missing access_token"
         ]

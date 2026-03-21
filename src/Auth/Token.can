@@ -155,12 +155,7 @@ save strategy tokens =
         tag =
             storageStrategyToInt strategy
     in
-    Task.perform (\_ -> neverMsg) (AuthFFI.saveTokenString tag json)
-
-
-neverMsg : () -> msg
-neverMsg _ =
-    neverMsg ()
+    Task.perform never (AuthFFI.saveTokenString tag json)
 
 
 {-| Load tokens from the configured storage area.
@@ -197,7 +192,7 @@ clear strategy =
         tag =
             storageStrategyToInt strategy
     in
-    Task.perform (\_ -> neverMsg) (AuthFFI.clearTokenString tag)
+    Task.perform never (AuthFFI.clearTokenString tag)
 
 
 

@@ -14,6 +14,11 @@ module Auth.OAuth exposing
     , oauthErrorToString
     , buildQueryString
     , parseQueryString
+    , generateCodeVerifier
+    , generateCodeChallenge
+    , generateState
+    , exchangeCode
+    , decodeCodeExchangeResponse
     )
 
 
@@ -24,13 +29,15 @@ Code flow with PKCE (Proof Key for Code Exchange), which is the
 recommended flow for single-page applications (SPAs) that cannot
 securely store a client secret.
 
-**Flow overview:**
+**Complete flow:**
 
-1. Generate a PKCE challenge pair (code\_verifier + code\_challenge)
-2. Build the authorization URL and redirect the user to the provider
-3. Parse the authorization response from the redirect URL
-4. Validate the state parameter matches (CSRF protection)
-5. Exchange the authorization code for tokens (server-side or via CORS)
+1. `generateCodeVerifier` — generate the PKCE code verifier
+2. `generateCodeChallenge` — derive the S256 challenge from the verifier
+3. `generateState` — generate a random state parameter for CSRF protection
+4. `authorizationUrl` — build the redirect URL and send the user there
+5. `parseRedirect` — parse the code and state from the callback URL
+6. `validateState` — verify the state matches (CSRF check)
+7. `exchangeCode` — POST the code + verifier to the token endpoint
 
 # Provider Configuration
 
@@ -39,6 +46,10 @@ securely store a client secret.
 # PKCE
 
 @docs PkceChallenge
+
+# PKCE Generation
+
+@docs generateCodeVerifier, generateCodeChallenge, generateState
 
 # Flow State
 
@@ -51,6 +62,10 @@ securely store a client secret.
 # Response Parsing
 
 @docs parseRedirect, validateState
+
+# Code Exchange
+
+@docs exchangeCode, decodeCodeExchangeResponse
 
 # Provider Presets
 
@@ -67,7 +82,13 @@ securely store a client secret.
 -}
 
 
+foreign import javascript "external/auth.js" as OAuthFFI
+
+import Auth.Token exposing (TokenResponse, tokenResponseDecoder)
 import Dict exposing (Dict)
+import Http
+import Json.Decode
+import Task exposing (Task)
 import Url
 
 
@@ -343,6 +364,130 @@ auth0 opts =
     , scopes = opts.scopes
     , audience = Just opts.audience
     }
+
+
+
+-- PKCE GENERATION
+
+
+{-| Generate a cryptographically random PKCE code verifier (43-character base64url string).
+
+Call this first, then pass the result to `generateCodeChallenge` to get the full
+`PkceChallenge`. Store the verifier in your model — you will need it for `exchangeCode`.
+
+    Auth.OAuth.generateCodeVerifier
+        |> Task.andThen Auth.OAuth.generateCodeChallenge
+        |> Task.attempt GotPkceChallenge
+
+-}
+generateCodeVerifier : Task OAuthError String
+generateCodeVerifier =
+    OAuthFFI.generateCodeVerifier ()
+        |> Task.mapError PkceError
+
+
+{-| Derive a PKCE S256 challenge from a code verifier.
+
+Computes the SHA-256 hash of the verifier and base64url-encodes it, producing
+a `PkceChallenge` record ready for use with `authorizationUrl`.
+
+    Auth.OAuth.generateCodeVerifier
+        |> Task.andThen Auth.OAuth.generateCodeChallenge
+        |> Task.attempt GotPkceChallenge
+
+-}
+generateCodeChallenge : String -> Task OAuthError PkceChallenge
+generateCodeChallenge verifier =
+    OAuthFFI.computeCodeChallenge verifier
+        |> Task.mapError PkceError
+        |> Task.map
+            (\challenge ->
+                { codeVerifier = verifier
+                , codeChallenge = challenge
+                , codeChallengeMethod = "S256"
+                }
+            )
+
+
+{-| Generate a cryptographically random state parameter for CSRF protection.
+
+The state must be stored in your model so it can be compared with the value
+returned by the provider in the redirect URL (via `validateState`).
+
+-}
+generateState : Task OAuthError String
+generateState =
+    OAuthFFI.generateRandomState ()
+        |> Task.mapError never
+
+
+
+-- CODE EXCHANGE
+
+
+{-| Exchange an authorization code for tokens.
+
+Call this after `parseRedirect` and `validateState` both succeed. Sends a POST
+request to the provider's token endpoint with the authorization code, code verifier,
+client ID, and redirect URI.
+
+    Auth.OAuth.exchangeCode googleConfig challenge authResponse
+        |> Task.attempt GotTokenResponse
+
+-}
+exchangeCode
+    : ProviderConfig
+    -> PkceChallenge
+    -> AuthResponse
+    -> Task OAuthError TokenResponse
+exchangeCode provider challenge response =
+    Http.task
+        { method = "POST"
+        , headers = []
+        , url = provider.tokenEndpoint
+        , body =
+            Http.stringBody "application/x-www-form-urlencoded"
+                (buildQueryString
+                    [ ( "grant_type", "authorization_code" )
+                    , ( "code", response.code )
+                    , ( "redirect_uri", provider.redirectUri )
+                    , ( "client_id", provider.clientId )
+                    , ( "code_verifier", challenge.codeVerifier )
+                    ]
+                )
+        , resolver = Http.stringResolver decodeCodeExchangeResponse
+        , timeout = Nothing
+        }
+
+
+{-| Decode an HTTP response from a token endpoint into a token response or error.
+
+Exposed for testing. In production use, this is called by `exchangeCode` via
+the HTTP resolver.
+-}
+decodeCodeExchangeResponse : Http.Response String -> Result OAuthError TokenResponse
+decodeCodeExchangeResponse response =
+    case response of
+        Http.GoodStatus_ _ body ->
+            decodeTokenBody body
+
+        Http.BadStatus_ meta _ ->
+            Err (CodeExchangeError ("HTTP " ++ String.fromInt meta.statusCode))
+
+        Http.Timeout_ ->
+            Err (CodeExchangeError "Request timed out")
+
+        Http.NetworkError_ ->
+            Err (CodeExchangeError "Network error")
+
+        Http.BadUrl_ badUrl ->
+            Err (CodeExchangeError ("Bad URL: " ++ badUrl))
+
+
+decodeTokenBody : String -> Result OAuthError TokenResponse
+decodeTokenBody body =
+    Json.Decode.decodeString tokenResponseDecoder body
+        |> Result.mapError (TokenDecodeError << Json.Decode.errorToString)
 
 
 

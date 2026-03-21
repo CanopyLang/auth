@@ -14,6 +14,7 @@ module Auth exposing
     , getAccessToken
     , getAuthenticatedUser
     , login
+    , logout
     , isExpired
     , isExpiringSoon
     , mapSession
@@ -70,7 +71,7 @@ be used to re-authenticate on the next visit).
 
 # Session Transitions
 
-@docs login
+@docs login, logout
 
 # Expiry
 
@@ -262,6 +263,22 @@ and tokens.
 login : AuthenticatedUser user -> Session user
 login auth =
     Authenticated auth
+
+
+{-| Transition to the `Guest` state, ending the session.
+
+This is a pure state transition. To also wipe any persisted tokens, call
+`Auth.Token.clear` with your storage strategy in the same `update` branch:
+
+    LogoutClicked ->
+        ( { model | session = Auth.logout model.session }
+        , Auth.Token.clear model.config.storage
+        )
+
+-}
+logout : Session user -> Session user
+logout _ =
+    Guest
 
 
 
